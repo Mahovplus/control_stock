@@ -9,19 +9,19 @@ flowchart TB
 
   subgraph OurSystem["Наша система"]
     integr["iiko Integration<br/>webhook receiver или polling worker"]
-    api["Backend API<br/>правила списания, пороги, идемпотентность"]
-    bot["Bot Service<br/>команды, кнопки, UI"]
-    db[("PostgreSQL<br/>stock, dishes, events")]
+    core["Backend Core API<br/>остатки, пороги, правила, идемпотентность"]
+    notify["Notification/Bot Service<br/>формат сообщений, кнопки, отправка"]
+    db[("PostgreSQL<br/>stock, events, outbox")]
   end
 
   iiko -->|"push: webhook (если доступно)"| integr
   integr -->|"pull: polling (если webhook нет)"| iiko
 
-  integr -->|"KitchenPrintEvent"| api
-  bot -->|"HTTP"| api
+  integr -->|"Sale/KitchenPrint event"| core
+  core <--> db
 
-  api <--> db
-  bot --> tgapi
-  api --> tgapi
+  core -->|"write outbox событие"| db
+  notify -->|"read outbox (pending)"| db
+  notify -->|"sendMessage/editMessage"| tgapi
 
-  api -.->|"опционально: stoplist on/off"| iiko
+  core -.->|"опционально: stoplist on/off"| iiko
