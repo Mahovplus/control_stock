@@ -1,3 +1,5 @@
+## Architecture (Context)
+
 ```mermaid
 flowchart TB
   subgraph External[Внешние системы]
