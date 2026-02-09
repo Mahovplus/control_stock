@@ -2,26 +2,11 @@
 
 ```mermaid
 flowchart TB
-  subgraph External[Внешние системы]
-    iiko[iiko]
-    tgapi[Telegram API]
-  end
+  iiko["iiko<br/>касса / печать кухни"] -->|"событие: напечатан кухонный чек<br/>позиции, qty, ids"| backend["Backend<br/>наш сервис"]
+  chef["Су-шеф / кухня"] -->|"команды в TG"| bot["Telegram Bot<br/>UI"]
+  bot <-->|"HTTP"| backend
+  backend <--> db[("БД<br/>остатки + события")]
+  backend -->|"уведомления"| chat["Чат сотрудников (TG)"]
 
-  subgraph OurSystem[Наша система]
-    bot[Bot Service\n(команды, кнопки, UI)]
-    api[Backend API\n(доменные правила, уведомления)]
-    integr[iiko Integration\n(Webhook receiver ИЛИ Polling worker)]
-    db[(PostgreSQL)\nstock, dishes, events]
-  end
+  backend -.->|"опционально: выставить/снять стоп-лист"| iiko
 
-  iiko -->|webhook push\n(если возможно)| integr
-  integr -->|polling pull\n(если webhook нет)| iiko
-
-  integr -->|KitchenPrintEvent| api
-  bot -->|HTTP| api
-
-  api <--> db
-  bot --> tgapi
-  api --> tgapi
-
-  api -.->|опционально:\nstoplist on/off| iiko
