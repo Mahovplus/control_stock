@@ -1,3 +1,4 @@
+```mermaid
 flowchart TB
   iiko[iiko\n(касса/печать кухни)] -->|событие: напечатан кухонный чек\nпозиции, qty, ids| backend[Backend (наш сервис)]
   chef[Су-шеф / кухня] -->|команды в TG| tg[Telegram Bot]
