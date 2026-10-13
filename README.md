@@ -16,6 +16,10 @@ iiko, уведомления и чат официантов появятся н�
 
 ## Как запустить
 
+На Windows проще всего: заполнить `.env` (копия `.env.example`) и дважды кликнуть `zapusk.cmd`. Он сам перейдёт в папку проекта, поставит библиотеки и запустит бота.
+
+Вручную:
+
 ```bash
 python3 -m pip install -r requirements.txt
 cp .env.example .env      # вписать BOT_TOKEN и SOUS_CHEF_ID

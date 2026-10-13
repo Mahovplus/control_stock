@@ -78,3 +78,28 @@ def test_format_stock_shows_stop(conn):
 
 def test_router_builds(conn):
     assert make_router(conn, sous_chef_id=123) is not None
+
+
+def test_config_explains_wrong_chef_id(tmp_path, monkeypatch):
+    """Типичная ошибка: вместо числового ID вписали имя бота."""
+    from bot.config import load_config
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("BOT_TOKEN=1:abc\nSOUS_CHEF_ID= maritozzocontrol_bot\n", encoding="utf-8")
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SOUS_CHEF_ID", raising=False)
+    with pytest.raises(SystemExit) as e:
+        load_config()
+    assert "SOUS_CHEF_ID должен быть числом" in str(e.value)
+    assert "Нет файла .env" not in str(e.value)
+
+
+def test_config_reads_env_with_spaces(tmp_path, monkeypatch):
+    from bot.config import load_config
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("BOT_TOKEN= 1:abc\nSOUS_CHEF_ID= 123\n", encoding="utf-8")
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SOUS_CHEF_ID", raising=False)
+    cfg = load_config()
+    assert (cfg.bot_token, cfg.sous_chef_id) == ("1:abc", 123)

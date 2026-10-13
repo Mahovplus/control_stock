@@ -30,6 +30,16 @@ def load_config() -> Config:
     load_env_file()
     token = os.environ.get("BOT_TOKEN", "")
     chef = os.environ.get("SOUS_CHEF_ID", "")
-    if not token or not chef.isdigit():
-        raise SystemExit("Заполни BOT_TOKEN и SOUS_CHEF_ID в файле .env (образец: .env.example)")
+    # Говорим точно, что не так: человеку без опыта так проще найти ошибку
+    problems = []
+    if not token:
+        problems.append("BOT_TOKEN пустой: впишите токен от @BotFather")
+    if not chef.isdigit():
+        problems.append(
+            f"SOUS_CHEF_ID должен быть числом из @userinfobot, сейчас там: «{chef}»"
+        )
+    if problems and not os.path.exists(".env"):
+        problems.insert(0, f"Нет файла .env в папке {os.getcwd()} (образец: .env.example)")
+    if problems:
+        raise SystemExit("Не могу запустить бота:\n- " + "\n- ".join(problems))
     return Config(token, int(chef), os.environ.get("DB_PATH", "data/ostatki.db"))
