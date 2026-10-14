@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerCallbackQuery, SendMessage
+from aiogram.methods import AnswerCallbackQuery, SendMessage, SendPhoto
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
 from bot import stock
@@ -35,6 +35,12 @@ class FakeSession(BaseSession):
             return Message(
                 message_id=1, date=datetime.now(), chat=Chat(id=method.chat_id, type="private"),
                 text=method.text,
+            )
+        if isinstance(method, SendPhoto):  # для проверки важна подпись
+            self.sent.append(method.caption)
+            self.chats.append(method.chat_id)
+            return Message(
+                message_id=1, date=datetime.now(), chat=Chat(id=method.chat_id, type="private"),
             )
         if isinstance(method, AnswerCallbackQuery):
             return True
@@ -108,6 +114,16 @@ def test_full_flow_add_replenish_recount():
     out = h.say("8")
     assert "Пересчёт закончен" in out[0] and "расхождение -2" in out[0]
     assert stock.get_dish(h.conn, dish.id).free == 8
+
+
+def test_welcome_picture_and_help():
+    from bot.handlers import WELCOME_PICTURE, WELCOME_TEXT
+
+    assert WELCOME_PICTURE.exists()
+    assert len(WELCOME_TEXT) <= 1024  # лимит подписи к фото в Telegram
+    h = Harness()
+    assert h.say("/start") == [WELCOME_TEXT]
+    assert h.say("/help") == [WELCOME_TEXT]
 
 
 def test_bot_ignores_everyone_except_sous_chef():

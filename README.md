@@ -57,6 +57,7 @@ python3 -m pytest
 | `bot/handlers.py` | Кнопки и диалоги су-шефа в Telegram |
 | `bot/config.py` | Читает токен и настройки из `.env` |
 | `bot/main.py` | Запуск бота |
+| `assets/welcome.png` | Картинка к приветствию на /start и /help |
 
 ## Architecture (Context)
 

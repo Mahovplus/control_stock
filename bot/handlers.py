@@ -6,6 +6,7 @@
 import logging
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -14,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -28,6 +30,31 @@ BTN_REPLENISH = "➕ Пополнить"
 BTN_RECOUNT = "🔄 Утренний пересчёт"
 BTN_ADD = "🍽 Добавить блюдо"
 BTN_SALE = "🧾 Продажа (тест)"  # пока iiko не подключена, продажу вводим руками
+
+WELCOME_PICTURE = Path(__file__).resolve().parent.parent / "assets" / "welcome.png"
+
+# Подпись к картинке в Telegram: не больше 1024 символов (проверяет тест)
+WELCOME_TEXT = f"""Здравствуйте, шеф! 👋
+Я помощник кухни: считаю порционные блюда, чтобы гостю не сказали «уже закончилось».
+
+Кнопки:
+• {BTN_LIST}: сколько порций свободно и сколько в работе.
+• {BTN_REPLENISH}: приготовили партию, добавьте порции. Блюдо выйдет из стопа.
+• {BTN_RECOUNT}: спрошу факт по каждому блюду и покажу расхождения.
+• {BTN_ADD}: новое порционное блюдо в список.
+
+Сам слежу и пишу:
+• Осталось 3 порции: предупрежу один раз.
+• 0 порций: ставлю в стоп и спрашиваю, через сколько будет. Официантам сообщу время.
+• Время вышло: спрошу «Готово?». «Да» вернёт блюдо в продажу.
+• Пробили, а порций нет: срочно напишу вам и официантам.
+
+Важно:
+• Отвечаю только су-шефу.
+• Остаток не уходит ниже 0, решение всегда за вами.
+• Пока iiko не подключена, стоп в iiko ставьте вручную, а продажи для проверки вводите кнопкой «{BTN_SALE}».
+
+Эта памятка всегда по команде /help."""
 
 HOURS = (1, 2, 3)  # раздел 6: через сколько блюдо вернётся
 
@@ -136,12 +163,15 @@ def make_router(
         await message.answer(f"ID этого чата: {message.chat.id}")
 
     @router.message(CommandStart())
+    @router.message(Command("help"))
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer(
-            "Здравствуйте, шеф! Я слежу за порционными блюдами. Выберите, что сделать.",
-            reply_markup=MAIN_MENU,
-        )
+        if WELCOME_PICTURE.exists():
+            await message.answer_photo(
+                FSInputFile(WELCOME_PICTURE), caption=WELCOME_TEXT, reply_markup=MAIN_MENU
+            )
+        else:  # картинку случайно удалили: памятка всё равно нужна
+            await message.answer(WELCOME_TEXT, reply_markup=MAIN_MENU)
 
     @router.message(F.text == BTN_LIST)
     async def show_stock(message: Message, state: FSMContext) -> None:
