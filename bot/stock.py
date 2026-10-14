@@ -1,13 +1,16 @@
 """Логика остатков без Telegram и без iiko.
 
-Здесь только правила из logika-bota.md (разделы 3 и 7), чтобы их можно было
+Здесь только правила из logika-bota.md (разделы 3, 5, 6 и 7), чтобы их можно было
 проверить тестами. Telegram-кнопки (handlers.py) лишь вызывают эти функции.
 """
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 MAX_PORTIONS = 999  # защита от опечатки вроде «1000» вместо «10»
+LOW_STOCK = 3       # раздел 5: один порог для всех блюд
+TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 
 
 class StockError(ValueError):
@@ -21,6 +24,16 @@ class Dish:
     free: int
     in_work: int
     in_stop: bool
+
+
+@dataclass
+class SaleResult:
+    """Что случилось после продажи и о чём надо сообщить."""
+
+    dish: Dish
+    oversold: bool = False  # пробили, а свободных порций не было
+    low_alert: bool = False  # стало 3 или меньше, сообщаем первый раз
+    ran_out: bool = False    # стало 0, блюдо ушло в стоп
 
 
 def _to_dish(row: sqlite3.Row) -> Dish:
@@ -66,19 +79,43 @@ def parse_count(text: str, allow_zero: bool) -> int:
 
 
 def replenish(conn: sqlite3.Connection, dish_id: int, qty: int, who: str) -> Dish:
-    """Пополнение (раздел 7): свободно + qty, блюдо выходит из стопа."""
+    """Пополнение (разделы 5 и 7).
+
+    Сначала порции закрывают позиции «сверх остатка»: они уходят «в работу»,
+    свободно не растёт, чтобы порцию не продали второй раз. Остальное идёт
+    в «свободно». Если свободно стало больше 0, блюдо выходит из стопа.
+    """
     if qty <= 0:
         raise StockError("Пополнить можно минимум на 1 порцию.")
     dish = get_dish(conn, dish_id)
+    waiting = [r["id"] for r in conn.execute(
+        "SELECT id FROM oversells WHERE dish_id = ? AND resolved_at IS NULL ORDER BY id",
+        (dish_id,),
+    )]
+    covered = min(qty, len(waiting))
+    to_free = qty - covered
+    free_after = dish.free + to_free
     with conn:  # всё внутри либо запишется целиком, либо не запишется вовсе
         conn.execute(
-            "UPDATE dishes SET free = free + ?, in_stop = 0 WHERE id = ?", (qty, dish_id)
+            "UPDATE dishes SET free = ?, in_work = in_work + ?, "
+            "in_stop = CASE WHEN ? > 0 THEN 0 ELSE in_stop END, "
+            "low_alerted = CASE WHEN ? > ? THEN 0 ELSE low_alerted END "
+            "WHERE id = ?",
+            (free_after, covered, free_after, free_after, LOW_STOCK, dish_id),
         )
+        for oversell_id in waiting[:covered]:
+            conn.execute(
+                "UPDATE oversells SET resolved_at = datetime('now', 'localtime') WHERE id = ?",
+                (oversell_id,),
+            )
         conn.execute(
-            "INSERT INTO journal (dish_id, action, delta, free_after, who) "
-            "VALUES (?, 'replenish', ?, ?, ?)",
-            (dish_id, qty, dish.free + qty, who),
+            "INSERT INTO journal (dish_id, action, delta, free_after, who, comment) "
+            "VALUES (?, 'replenish', ?, ?, ?, ?)",
+            (dish_id, to_free, free_after, who,
+             f"{covered} закрыли «сверх остатка»" if covered else None),
         )
+        if free_after > 0:
+            conn.execute("DELETE FROM timers WHERE dish_id = ?", (dish_id,))
     return get_dish(conn, dish_id)
 
 
@@ -93,10 +130,88 @@ def recount(conn: sqlite3.Connection, dish_id: int, actual: int, who: str) -> in
     dish = get_dish(conn, dish_id)
     diff = actual - dish.free
     with conn:
-        conn.execute("UPDATE dishes SET free = ? WHERE id = ?", (actual, dish_id))
+        conn.execute(
+            "UPDATE dishes SET free = ?, "
+            "in_stop = CASE WHEN ? = 0 THEN 1 ELSE in_stop END, "  # 0 = в стоп
+            "low_alerted = CASE WHEN ? > ? THEN 0 ELSE low_alerted END "
+            "WHERE id = ?",
+            (actual, actual, actual, LOW_STOCK, dish_id),
+        )
         conn.execute(
             "INSERT INTO journal (dish_id, action, delta, free_after, who, comment) "
             "VALUES (?, 'recount', ?, ?, ?, ?)",
             (dish_id, diff, actual, who, "расхождение" if diff else None),
         )
     return diff
+
+
+def sell(conn: sqlite3.Connection, dish_id: int, who: str) -> SaleResult:
+    """Пробили одну порцию (раздел 4): свободно −1, в работе +1.
+
+    Пока iiko не подключена, продажу вводит су-шеф кнопкой для проверки.
+    Если свободных порций нет, ниже 0 не уходим: записываем «сверх остатка».
+    """
+    dish = get_dish(conn, dish_id)
+    if dish.free == 0:
+        with conn:
+            conn.execute("INSERT INTO oversells (dish_id) VALUES (?)", (dish_id,))
+            conn.execute(
+                "INSERT INTO journal (dish_id, action, delta, free_after, who, comment) "
+                "VALUES (?, 'oversell', 0, 0, ?, 'сверх остатка, ждёт решения')",
+                (dish_id, who),
+            )
+        return SaleResult(get_dish(conn, dish_id), oversold=True)
+
+    free_after = dish.free - 1
+    already = conn.execute(
+        "SELECT low_alerted FROM dishes WHERE id = ?", (dish_id,)
+    ).fetchone()["low_alerted"]
+    low_alert = 0 < free_after <= LOW_STOCK and not already
+    ran_out = free_after == 0
+    with conn:
+        conn.execute(
+            "UPDATE dishes SET free = ?, in_work = in_work + 1, "
+            "low_alerted = CASE WHEN ? <= ? THEN 1 ELSE low_alerted END, "
+            "in_stop = CASE WHEN ? = 0 THEN 1 ELSE in_stop END "
+            "WHERE id = ?",
+            (free_after, free_after, LOW_STOCK, free_after, dish_id),
+        )
+        conn.execute(
+            "INSERT INTO journal (dish_id, action, delta, free_after, who) "
+            "VALUES (?, 'sale', -1, ?, ?)",
+            (dish_id, free_after, who),
+        )
+    return SaleResult(get_dish(conn, dish_id), low_alert=low_alert, ran_out=ran_out)
+
+
+def pending_oversells(conn: sqlite3.Connection, dish_id: int) -> int:
+    """Сколько позиций «сверх остатка» по блюду ещё ждут решения."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM oversells WHERE dish_id = ? AND resolved_at IS NULL",
+        (dish_id,),
+    ).fetchone()[0]
+
+
+# --- Таймер «когда будет готово» (раздел 6) ------------------------------
+
+def set_timer(conn: sqlite3.Connection, dish_id: int, hours: int, now: datetime) -> datetime:
+    """Запоминает, когда спросить «готово?». Новый таймер заменяет старый."""
+    due = now + timedelta(hours=hours)
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO timers (dish_id, due_at) VALUES (?, ?)",
+            (dish_id, due.strftime(TIME_FORMAT)),
+        )
+    return due
+
+
+def take_due_timers(conn: sqlite3.Connection, now: datetime) -> list[Dish]:
+    """Блюда, по которым пора спросить «готово?». Таймер срабатывает один раз."""
+    rows = conn.execute(
+        "SELECT dish_id FROM timers WHERE due_at <= ? ORDER BY due_at",
+        (now.strftime(TIME_FORMAT),),
+    ).fetchall()
+    with conn:
+        for r in rows:
+            conn.execute("DELETE FROM timers WHERE dish_id = ?", (r["dish_id"],))
+    return [get_dish(conn, r["dish_id"]) for r in rows]

@@ -1,12 +1,15 @@
-"""Кнопки и диалоги су-шефа в Telegram (раздел 7 logika-bota.md).
+"""Кнопки и диалоги су-шефа в Telegram (разделы 5, 6 и 7 logika-bota.md).
 
 Каждый обработчик только разговаривает с человеком, а считает stock.py.
 """
 
+import logging
 import sqlite3
+from datetime import datetime
 
-from aiogram import F, Router
-from aiogram.filters import CommandStart
+from aiogram import Bot, F, Router
+from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
@@ -24,11 +27,15 @@ BTN_LIST = "📋 Остатки"
 BTN_REPLENISH = "➕ Пополнить"
 BTN_RECOUNT = "🔄 Утренний пересчёт"
 BTN_ADD = "🍽 Добавить блюдо"
+BTN_SALE = "🧾 Продажа (тест)"  # пока iiko не подключена, продажу вводим руками
+
+HOURS = (1, 2, 3)  # раздел 6: через сколько блюдо вернётся
 
 MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_LIST), KeyboardButton(text=BTN_REPLENISH)],
         [KeyboardButton(text=BTN_RECOUNT), KeyboardButton(text=BTN_ADD)],
+        [KeyboardButton(text=BTN_SALE)],
     ],
     resize_keyboard=True,
 )
@@ -61,7 +68,57 @@ def dishes_keyboard(dishes: list[stock.Dish], prefix: str) -> InlineKeyboardMark
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def make_router(conn: sqlite3.Connection, sous_chef_id: int) -> Router:
+def hours_text(h: int) -> str:
+    return "1 час" if h == 1 else f"{h} часа"
+
+
+def eta_keyboard(dish_id: int) -> InlineKeyboardMarkup:
+    """Кнопки «1 час / 2 часа / 3 часа». В callback_data: «eta:блюдо:часы»."""
+    row = [
+        InlineKeyboardButton(text=hours_text(h), callback_data=f"eta:{dish_id}:{h}")
+        for h in HOURS
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[row])
+
+
+def ready_keyboard(dish_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Да", callback_data=f"ready:{dish_id}:1"),
+        InlineKeyboardButton(text="Нет", callback_data=f"ready:{dish_id}:0"),
+    ]])
+
+
+def stop_text(name: str) -> str:
+    return (
+        f"⛔ Шеф, {name} закончилось, ставлю в стоп.\n"
+        "Поставьте в стоп и в iiko вручную: iiko пока не подключена.\n"
+        "Через сколько будет?"
+    )
+
+
+async def notify_waiters(bot: Bot, waiters_chat_id: int | None, sous_chef_id: int, text: str) -> None:
+    """Пишет в чат официантов. Если не вышло, говорит об этом су-шефу, а не молчит."""
+    if waiters_chat_id is None:
+        await bot.send_message(
+            sous_chef_id,
+            "Чат официантов не настроен, им я не написал. "
+            "Как настроить: WAITERS_CHAT_ID в файле .env.",
+        )
+        return
+    try:
+        await bot.send_message(waiters_chat_id, text)
+    except TelegramAPIError as e:
+        logging.warning("Не смог написать в чат официантов: %s", e)
+        await bot.send_message(
+            sous_chef_id,
+            "Не смог написать в чат официантов. Проверьте, что бот добавлен в группу "
+            "и WAITERS_CHAT_ID в .env верный.",
+        )
+
+
+def make_router(
+    conn: sqlite3.Connection, sous_chef_id: int, waiters_chat_id: int | None = None
+) -> Router:
     router = Router()
     # Бот отвечает только су-шефу (раздел 2). Остальных просто не слышит.
     router.message.filter(F.from_user.id == sous_chef_id)
@@ -69,6 +126,14 @@ def make_router(conn: sqlite3.Connection, sous_chef_id: int) -> Router:
 
     def who(user_id: int) -> str:
         return str(user_id)
+
+    async def to_waiters(bot: Bot, text: str) -> None:
+        await notify_waiters(bot, waiters_chat_id, sous_chef_id, text)
+
+    @router.message(Command("chatid"))
+    async def chat_id(message: Message) -> None:
+        # Напишите /chatid в группе официантов, чтобы узнать число для .env
+        await message.answer(f"ID этого чата: {message.chat.id}")
 
     @router.message(CommandStart())
     async def start(message: Message, state: FSMContext) -> None:
@@ -124,12 +189,21 @@ def make_router(conn: sqlite3.Connection, sous_chef_id: int) -> Router:
         data = await state.get_data()
         try:
             qty = stock.parse_count(message.text, allow_zero=False)
+            before = stock.get_dish(conn, data["dish_id"])
             dish = stock.replenish(conn, data["dish_id"], qty, who(message.from_user.id))
         except stock.StockError as e:
             await message.answer(str(e))
             return
         await state.clear()
-        await message.answer(f"Готово: {dish.name} +{qty}, свободно {dish.free}.")
+        covered = qty - (dish.free - before.free)
+        text = f"Готово: {dish.name} +{qty}, свободно {dish.free}."
+        if covered:
+            text += f"\n{covered} из них закрыли заказы, пробитые сверх остатка."
+        if before.in_stop and not dish.in_stop:
+            text += "\nБлюдо вышло из стопа. Снимите стоп и в iiko вручную."
+        await message.answer(text)
+        if before.in_stop and not dish.in_stop:
+            await to_waiters(message.bot, f"✅ {dish.name} снова в продаже.")
 
     # --- Утренний пересчёт ------------------------------------------------
     async def ask_next(message: Message, state: FSMContext) -> None:
@@ -159,15 +233,83 @@ def make_router(conn: sqlite3.Connection, sous_chef_id: int) -> Router:
         dish_id = data["queue"][0]
         try:
             actual = stock.parse_count(message.text, allow_zero=True)
+            was_in_stop = stock.get_dish(conn, dish_id).in_stop
             diff = stock.recount(conn, dish_id, actual, who(message.from_user.id))
         except stock.StockError as e:
             await message.answer(str(e))
             return
+        if actual == 0 and not was_in_stop:  # раздел 5: стало 0, значит стоп
+            name = stock.get_dish(conn, dish_id).name
+            await message.answer(stop_text(name), reply_markup=eta_keyboard(dish_id))
         report = data["report"]
         if diff:
             name = stock.get_dish(conn, dish_id).name
             report.append(f"• {name}: расхождение {diff:+d}")
         await state.update_data(queue=data["queue"][1:], report=report)
         await ask_next(message, state)
+
+    # --- Продажа для проверки (раздел 4, пока без iiko) -------------------
+    @router.message(F.text == BTN_SALE)
+    async def sale_start(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        dishes = stock.list_dishes(conn)
+        if not dishes:
+            await message.answer(format_stock(dishes))
+            return
+        await message.answer(
+            "Тест: какое блюдо пробили? Одно нажатие = одна порция.",
+            reply_markup=dishes_keyboard(dishes, "sale"),
+        )
+
+    @router.callback_query(F.data.startswith("sale:"))
+    async def sale_pick(call: CallbackQuery) -> None:
+        await call.answer()
+        result = stock.sell(conn, int(call.data.split(":")[1]), who(call.from_user.id))
+        await report_sale(call.message, result)
+
+    async def report_sale(message: Message, result: stock.SaleResult) -> None:
+        """Уведомления раздела 5 после одной продажи."""
+        dish = result.dish
+        if result.oversold:
+            await message.answer(
+                f"🚨 Шеф, {dish.name} пробили, а порций нет. Остаток остаётся 0.\n"
+                "Решите, что делать. Если сделаете порцию, добавьте её кнопкой "
+                f"«{BTN_REPLENISH}»: она закроет этот заказ."
+            )
+            await to_waiters(message.bot, f"🚨 {dish.name} пробили, а порций нет. Подойдите к су-шефу.")
+            return
+        await message.answer(f"Пробито: {dish.name}, свободно {dish.free}.")
+        if result.low_alert:
+            await message.answer(f"⚠️ Шеф, {dish.name}: осталось {dish.free} порции.")
+        if result.ran_out:
+            await message.answer(stop_text(dish.name), reply_markup=eta_keyboard(dish.id))
+
+    # --- Возврат в продажу (раздел 6) -------------------------------------
+    @router.callback_query(F.data.startswith("eta:"))
+    async def eta_pick(call: CallbackQuery) -> None:
+        await call.answer()
+        _, dish_id, hours = call.data.split(":")
+        dish = stock.get_dish(conn, int(dish_id))
+        due = stock.set_timer(conn, dish.id, int(hours), datetime.now())
+        await call.message.answer(
+            f"Понял. В {due:%H:%M} спрошу, готово ли {dish.name}."
+        )
+        await to_waiters(
+            call.bot, f"⛔ {dish.name} в стопе, будет примерно через {hours_text(int(hours))}."
+        )
+
+    @router.callback_query(F.data.startswith("ready:"))
+    async def ready_answer(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        _, dish_id, yes = call.data.split(":")
+        dish = stock.get_dish(conn, int(dish_id))
+        if yes == "1":
+            await state.set_state(Dialog.replenish_qty)
+            await state.update_data(dish_id=dish.id)
+            await call.message.answer(f"{dish.name}: сколько порций готово?")
+        else:
+            await call.message.answer(
+                f"{dish.name}: через сколько будет?", reply_markup=eta_keyboard(dish.id)
+            )
 
     return router
