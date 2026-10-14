@@ -45,7 +45,8 @@ WELCOME_TEXT = f"""Здравствуйте, шеф! 👋
 
 Сам слежу и пишу:
 • Осталось 3 порции: предупрежу один раз.
-• 0 порций: ставлю в стоп и спрашиваю, через сколько будет. Официантам сообщу время.
+• 0 порций: ставлю в стоп и сразу пишу официантам. Вам одна кнопка: через сколько будет.
+• Заняты и не ответили: через 15 минут напомню один раз.
 • Время вышло: спрошу «Готово?». «Да» вернёт блюдо в продажу.
 • Пробили, а порций нет: срочно напишу вам и официантам.
 
@@ -156,6 +157,12 @@ def make_router(
 
     async def to_waiters(bot: Bot, text: str) -> None:
         await notify_waiters(bot, waiters_chat_id, sous_chef_id, text)
+
+    async def went_to_stop(message: Message, dish: stock.Dish) -> None:
+        """Раздел 6: официанты узнают сразу, су-шефу одно сообщение с кнопками."""
+        await to_waiters(message.bot, f"⛔ {dish.name} в стопе. Когда вернётся, сообщу.")
+        await message.answer(stop_text(dish.name), reply_markup=eta_keyboard(dish.id))
+        stock.set_reminder(conn, dish.id, "eta", datetime.now())
 
     @router.message(Command("chatid"))
     async def chat_id(message: Message) -> None:
@@ -269,8 +276,7 @@ def make_router(
             await message.answer(str(e))
             return
         if actual == 0 and not was_in_stop:  # раздел 5: стало 0, значит стоп
-            name = stock.get_dish(conn, dish_id).name
-            await message.answer(stop_text(name), reply_markup=eta_keyboard(dish_id))
+            await went_to_stop(message, stock.get_dish(conn, dish_id))
         report = data["report"]
         if diff:
             name = stock.get_dish(conn, dish_id).name
@@ -312,7 +318,7 @@ def make_router(
         if result.low_alert:
             await message.answer(f"⚠️ Шеф, {dish.name}: осталось {dish.free} порции.")
         if result.ran_out:
-            await message.answer(stop_text(dish.name), reply_markup=eta_keyboard(dish.id))
+            await went_to_stop(message, dish)
 
     # --- Возврат в продажу (раздел 6) -------------------------------------
     @router.callback_query(F.data.startswith("eta:"))
@@ -320,12 +326,14 @@ def make_router(
         await call.answer()
         _, dish_id, hours = call.data.split(":")
         dish = stock.get_dish(conn, int(dish_id))
+        stock.clear_reminder(conn, dish.id, "eta")
+        stock.clear_reminder(conn, dish.id, "ready")
         due = stock.set_timer(conn, dish.id, int(hours), datetime.now())
         await call.message.answer(
             f"Понял. В {due:%H:%M} спрошу, готово ли {dish.name}."
         )
         await to_waiters(
-            call.bot, f"⛔ {dish.name} в стопе, будет примерно через {hours_text(int(hours))}."
+            call.bot, f"⏱ {dish.name} будет примерно через {hours_text(int(hours))}."
         )
 
     @router.callback_query(F.data.startswith("ready:"))
@@ -333,6 +341,7 @@ def make_router(
         await call.answer()
         _, dish_id, yes = call.data.split(":")
         dish = stock.get_dish(conn, int(dish_id))
+        stock.clear_reminder(conn, dish.id, "ready")
         if yes == "1":
             await state.set_state(Dialog.replenish_qty)
             await state.update_data(dish_id=dish.id)
@@ -341,5 +350,6 @@ def make_router(
             await call.message.answer(
                 f"{dish.name}: через сколько будет?", reply_markup=eta_keyboard(dish.id)
             )
+            stock.set_reminder(conn, dish.id, "eta", datetime.now())
 
     return router

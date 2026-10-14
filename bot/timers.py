@@ -12,19 +12,35 @@ from datetime import datetime
 from aiogram import Bot
 
 from bot import stock
-from bot.handlers import ready_keyboard
+from bot.handlers import eta_keyboard, ready_keyboard
 
 CHECK_EVERY_SECONDS = 30
 
 
 async def ask_due(bot: Bot, conn: sqlite3.Connection, sous_chef_id: int, now: datetime) -> int:
-    """Спрашивает су-шефа по каждому блюду, чьё время пришло. Возвращает, сколько спросил."""
+    """Спрашивает «готово?» и шлёт напоминания, чьё время пришло. Возвращает, сколько написал."""
     dishes = stock.take_due_timers(conn, now)
     for dish in dishes:
         await bot.send_message(
             sous_chef_id, f"Шеф, {dish.name} готово?", reply_markup=ready_keyboard(dish.id)
         )
-    return len(dishes)
+        stock.set_reminder(conn, dish.id, "ready", now)
+    sent = len(dishes)
+    for dish, kind in stock.take_due_reminders(conn, now):
+        if not dish.in_stop:  # уже пополнили: напоминать не о чем
+            continue
+        sent += 1
+        if kind == "eta":
+            await bot.send_message(
+                sous_chef_id,
+                f"Напоминаю: {dish.name} в стопе. Через сколько будет?",
+                reply_markup=eta_keyboard(dish.id),
+            )
+        else:
+            await bot.send_message(
+                sous_chef_id, f"Напоминаю: {dish.name} готово?", reply_markup=ready_keyboard(dish.id)
+            )
+    return sent
 
 
 async def timer_loop(bot: Bot, conn: sqlite3.Connection, sous_chef_id: int) -> None:
