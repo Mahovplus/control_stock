@@ -4,7 +4,8 @@
 - dishes: порционные блюда и их «карманы» (свободно, в работе, продано, списано);
 - journal: каждое движение порции, чтобы всегда можно было понять, откуда цифра;
 - oversells: пробили сверх остатка, ждём решения су-шефа (раздел 5);
-- timers: когда спросить су-шефа «готово?» (раздел 6).
+- timers: когда спросить су-шефа «готово?» (раздел 6);
+- reminders: одно напоминание су-шефу, если он не ответил (раздел 6).
 """
 
 import sqlite3
@@ -44,6 +45,13 @@ CREATE TABLE IF NOT EXISTS oversells (
 CREATE TABLE IF NOT EXISTS timers (
     dish_id INTEGER PRIMARY KEY REFERENCES dishes(id),  -- один таймер на блюдо
     due_at  TEXT NOT NULL           -- когда спросить «готово?», местное время
+);
+
+CREATE TABLE IF NOT EXISTS reminders (
+    dish_id INTEGER NOT NULL REFERENCES dishes(id),
+    kind    TEXT NOT NULL,          -- eta = не выбрал время, ready = не ответил «готово?»
+    due_at  TEXT NOT NULL,
+    PRIMARY KEY (dish_id, kind)
 );
 """
 

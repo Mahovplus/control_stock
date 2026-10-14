@@ -9,7 +9,7 @@ from datetime import datetime, timedelta
 
 from aiogram import Bot, Dispatcher
 from aiogram.client.session.base import BaseSession
-from aiogram.methods import AnswerCallbackQuery, SendMessage
+from aiogram.methods import AnswerCallbackQuery, SendMessage, SendPhoto
 from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
 from bot import stock
@@ -35,6 +35,12 @@ class FakeSession(BaseSession):
             return Message(
                 message_id=1, date=datetime.now(), chat=Chat(id=method.chat_id, type="private"),
                 text=method.text,
+            )
+        if isinstance(method, SendPhoto):  # для проверки важна подпись
+            self.sent.append(method.caption)
+            self.chats.append(method.chat_id)
+            return Message(
+                message_id=1, date=datetime.now(), chat=Chat(id=method.chat_id, type="private"),
             )
         if isinstance(method, AnswerCallbackQuery):
             return True
@@ -110,6 +116,16 @@ def test_full_flow_add_replenish_recount():
     assert stock.get_dish(h.conn, dish.id).free == 8
 
 
+def test_welcome_picture_and_help():
+    from bot.handlers import WELCOME_PICTURE, WELCOME_TEXT
+
+    assert WELCOME_PICTURE.exists()
+    assert len(WELCOME_TEXT) <= 1024  # лимит подписи к фото в Telegram
+    h = Harness()
+    assert h.say("/start") == [WELCOME_TEXT]
+    assert h.say("/help") == [WELCOME_TEXT]
+
+
 def test_bot_ignores_everyone_except_sous_chef():
     h = Harness()
     assert h.say("/start", user_id=STRANGER) == []
@@ -136,16 +152,21 @@ def test_low_stock_stop_timer_and_back_to_sale():
     assert not any("осталось" in t for t in h.press(f"sale:{dish.id}"))  # второй раз молчит
     h.press(f"sale:{dish.id}")
     out = h.press(f"sale:{dish.id}")
+    # официанты узнают первыми, су-шефа бот не ждёт
+    assert h.to_waiters() == ["⛔ Вителло тоннато в стопе. Когда вернётся, сообщу."]
+    assert out.index(h.to_waiters()[0]) < len(out) - 1
     assert "закончилось, ставлю в стоп" in out[-1] and "Через сколько" in out[-1]
     assert stock.get_dish(h.conn, dish.id).in_stop
 
     out = h.press(f"eta:{dish.id}:2")
     assert "спрошу, готово ли" in out[0]
-    assert h.to_waiters() == ["⛔ Вителло тоннато в стопе, будет примерно через 2 часа."]
+    assert h.to_waiters()[-1] == "⏱ Вителло тоннато будет примерно через 2 часа."
 
-    assert h.tick(datetime.now() + timedelta(hours=1)) == []  # ещё рано
-    assert h.tick(datetime.now() + timedelta(hours=2, minutes=1)) == ["Шеф, Вителло тоннато готово?"]
-    assert h.tick(datetime.now() + timedelta(hours=3)) == []  # спрашивает один раз
+    assert h.tick(datetime.now() + timedelta(hours=1)) == []  # ещё рано, напоминаний нет
+    t = datetime.now() + timedelta(hours=2, minutes=1)
+    assert h.tick(t) == ["Шеф, Вителло тоннато готово?"]
+    assert h.tick(t + timedelta(minutes=16)) == ["Напоминаю: Вителло тоннато готово?"]
+    assert h.tick(t + timedelta(hours=3)) == []  # напоминает только один раз
 
     assert "сколько порций готово" in h.press(f"ready:{dish.id}:1")[0]
     out = h.say("6")
@@ -162,7 +183,7 @@ def test_not_ready_asks_time_again():
     out = h.press(f"ready:{dish.id}:0")
     assert "через сколько будет" in out[0]
     h.press(f"eta:{dish.id}:3")
-    assert h.to_waiters()[-1] == "⛔ Вителло тоннато в стопе, будет примерно через 3 часа."
+    assert h.to_waiters()[-1] == "⏱ Вителло тоннато будет примерно через 3 часа."
 
 
 def test_oversell_alerts_chef_and_waiters_without_negative():
@@ -201,3 +222,26 @@ def test_recount_to_zero_puts_dish_in_stop():
 def test_chatid_command_answers_with_chat_number():
     h = Harness()
     assert h.say("/chatid") == [f"ID этого чата: {CHEF}"]
+
+
+def test_busy_chef_gets_one_reminder_about_time():
+    """Раздел 6: су-шеф у плиты не ответил, напомним один раз через 15 минут."""
+    h = Harness()
+    dish = _dish_with(h, 1)
+    h.press(f"sale:{dish.id}")
+    now = datetime.now()
+    assert h.tick(now + timedelta(minutes=10)) == []
+    assert h.tick(now + timedelta(minutes=16)) == ["Напоминаю: Вителло тоннато в стопе. Через сколько будет?"]
+    assert h.tick(now + timedelta(hours=1)) == []
+
+
+def test_no_reminder_after_answer_or_replenish():
+    h = Harness()
+    dish = _dish_with(h, 1)
+    h.press(f"sale:{dish.id}")
+    h.press(f"eta:{dish.id}:1")  # ответил: про время не напоминаем
+    assert h.tick(datetime.now() + timedelta(minutes=20)) == []
+
+    h.press(f"rep:{dish.id}")
+    h.say("3")  # пополнил раньше таймера: ни «готово?», ни напоминаний
+    assert h.tick(datetime.now() + timedelta(hours=5)) == []

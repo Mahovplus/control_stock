@@ -6,6 +6,7 @@
 import logging
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -14,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
     KeyboardButton,
@@ -28,6 +30,32 @@ BTN_REPLENISH = "➕ Пополнить"
 BTN_RECOUNT = "🔄 Утренний пересчёт"
 BTN_ADD = "🍽 Добавить блюдо"
 BTN_SALE = "🧾 Продажа (тест)"  # пока iiko не подключена, продажу вводим руками
+
+WELCOME_PICTURE = Path(__file__).resolve().parent.parent / "assets" / "welcome.png"
+
+# Подпись к картинке в Telegram: не больше 1024 символов (проверяет тест)
+WELCOME_TEXT = f"""Здравствуйте, шеф! 👋
+Я помощник кухни: считаю порционные блюда, чтобы гостю не сказали «уже закончилось».
+
+Кнопки:
+• {BTN_LIST}: сколько порций свободно и сколько в работе.
+• {BTN_REPLENISH}: приготовили партию, добавьте порции. Блюдо выйдет из стопа.
+• {BTN_RECOUNT}: спрошу факт по каждому блюду и покажу расхождения.
+• {BTN_ADD}: новое порционное блюдо в список.
+
+Сам слежу и пишу:
+• Осталось 3 порции: предупрежу один раз.
+• 0 порций: ставлю в стоп и сразу пишу официантам. Вам одна кнопка: через сколько будет.
+• Заняты и не ответили: через 15 минут напомню один раз.
+• Время вышло: спрошу «Готово?». «Да» вернёт блюдо в продажу.
+• Пробили, а порций нет: срочно напишу вам и официантам.
+
+Важно:
+• Отвечаю только су-шефу.
+• Остаток не уходит ниже 0, решение всегда за вами.
+• Пока iiko не подключена, стоп в iiko ставьте вручную, а продажи для проверки вводите кнопкой «{BTN_SALE}».
+
+Эта памятка всегда по команде /help."""
 
 HOURS = (1, 2, 3)  # раздел 6: через сколько блюдо вернётся
 
@@ -130,18 +158,27 @@ def make_router(
     async def to_waiters(bot: Bot, text: str) -> None:
         await notify_waiters(bot, waiters_chat_id, sous_chef_id, text)
 
+    async def went_to_stop(message: Message, dish: stock.Dish) -> None:
+        """Раздел 6: официанты узнают сразу, су-шефу одно сообщение с кнопками."""
+        await to_waiters(message.bot, f"⛔ {dish.name} в стопе. Когда вернётся, сообщу.")
+        await message.answer(stop_text(dish.name), reply_markup=eta_keyboard(dish.id))
+        stock.set_reminder(conn, dish.id, "eta", datetime.now())
+
     @router.message(Command("chatid"))
     async def chat_id(message: Message) -> None:
         # Напишите /chatid в группе официантов, чтобы узнать число для .env
         await message.answer(f"ID этого чата: {message.chat.id}")
 
     @router.message(CommandStart())
+    @router.message(Command("help"))
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer(
-            "Здравствуйте, шеф! Я слежу за порционными блюдами. Выберите, что сделать.",
-            reply_markup=MAIN_MENU,
-        )
+        if WELCOME_PICTURE.exists():
+            await message.answer_photo(
+                FSInputFile(WELCOME_PICTURE), caption=WELCOME_TEXT, reply_markup=MAIN_MENU
+            )
+        else:  # картинку случайно удалили: памятка всё равно нужна
+            await message.answer(WELCOME_TEXT, reply_markup=MAIN_MENU)
 
     @router.message(F.text == BTN_LIST)
     async def show_stock(message: Message, state: FSMContext) -> None:
@@ -239,8 +276,7 @@ def make_router(
             await message.answer(str(e))
             return
         if actual == 0 and not was_in_stop:  # раздел 5: стало 0, значит стоп
-            name = stock.get_dish(conn, dish_id).name
-            await message.answer(stop_text(name), reply_markup=eta_keyboard(dish_id))
+            await went_to_stop(message, stock.get_dish(conn, dish_id))
         report = data["report"]
         if diff:
             name = stock.get_dish(conn, dish_id).name
@@ -282,7 +318,7 @@ def make_router(
         if result.low_alert:
             await message.answer(f"⚠️ Шеф, {dish.name}: осталось {dish.free} порции.")
         if result.ran_out:
-            await message.answer(stop_text(dish.name), reply_markup=eta_keyboard(dish.id))
+            await went_to_stop(message, dish)
 
     # --- Возврат в продажу (раздел 6) -------------------------------------
     @router.callback_query(F.data.startswith("eta:"))
@@ -290,12 +326,14 @@ def make_router(
         await call.answer()
         _, dish_id, hours = call.data.split(":")
         dish = stock.get_dish(conn, int(dish_id))
+        stock.clear_reminder(conn, dish.id, "eta")
+        stock.clear_reminder(conn, dish.id, "ready")
         due = stock.set_timer(conn, dish.id, int(hours), datetime.now())
         await call.message.answer(
             f"Понял. В {due:%H:%M} спрошу, готово ли {dish.name}."
         )
         await to_waiters(
-            call.bot, f"⛔ {dish.name} в стопе, будет примерно через {hours_text(int(hours))}."
+            call.bot, f"⏱ {dish.name} будет примерно через {hours_text(int(hours))}."
         )
 
     @router.callback_query(F.data.startswith("ready:"))
@@ -303,6 +341,7 @@ def make_router(
         await call.answer()
         _, dish_id, yes = call.data.split(":")
         dish = stock.get_dish(conn, int(dish_id))
+        stock.clear_reminder(conn, dish.id, "ready")
         if yes == "1":
             await state.set_state(Dialog.replenish_qty)
             await state.update_data(dish_id=dish.id)
@@ -311,5 +350,6 @@ def make_router(
             await call.message.answer(
                 f"{dish.name}: через сколько будет?", reply_markup=eta_keyboard(dish.id)
             )
+            stock.set_reminder(conn, dish.id, "eta", datetime.now())
 
     return router

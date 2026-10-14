@@ -11,6 +11,7 @@ from datetime import datetime, timedelta
 MAX_PORTIONS = 999  # защита от опечатки вроде «1000» вместо «10»
 LOW_STOCK = 3       # раздел 5: один порог для всех блюд
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+REMIND_AFTER = timedelta(minutes=15)  # раздел 6: су-шеф занят, напоминаем один раз
 
 
 class StockError(ValueError):
@@ -114,8 +115,9 @@ def replenish(conn: sqlite3.Connection, dish_id: int, qty: int, who: str) -> Dis
             (dish_id, to_free, free_after, who,
              f"{covered} закрыли «сверх остатка»" if covered else None),
         )
-        if free_after > 0:
+        if free_after > 0:  # блюдо в продаже: спрашивать и напоминать не о чем
             conn.execute("DELETE FROM timers WHERE dish_id = ?", (dish_id,))
+            conn.execute("DELETE FROM reminders WHERE dish_id = ?", (dish_id,))
     return get_dish(conn, dish_id)
 
 
@@ -215,3 +217,34 @@ def take_due_timers(conn: sqlite3.Connection, now: datetime) -> list[Dish]:
         for r in rows:
             conn.execute("DELETE FROM timers WHERE dish_id = ?", (r["dish_id"],))
     return [get_dish(conn, r["dish_id"]) for r in rows]
+
+
+# --- Напоминание, если су-шеф не ответил (раздел 6) -----------------------
+
+def set_reminder(conn: sqlite3.Connection, dish_id: int, kind: str, now: datetime) -> None:
+    """Через 15 минут напомнить один раз. kind: eta (время) или ready (готово?)."""
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO reminders (dish_id, kind, due_at) VALUES (?, ?, ?)",
+            (dish_id, kind, (now + REMIND_AFTER).strftime(TIME_FORMAT)),
+        )
+
+
+def clear_reminder(conn: sqlite3.Connection, dish_id: int, kind: str) -> None:
+    """Су-шеф ответил: напоминать не нужно."""
+    with conn:
+        conn.execute("DELETE FROM reminders WHERE dish_id = ? AND kind = ?", (dish_id, kind))
+
+
+def take_due_reminders(conn: sqlite3.Connection, now: datetime) -> list[tuple[Dish, str]]:
+    """Напоминания, время которых пришло. Каждое срабатывает один раз."""
+    rows = conn.execute(
+        "SELECT dish_id, kind FROM reminders WHERE due_at <= ? ORDER BY due_at",
+        (now.strftime(TIME_FORMAT),),
+    ).fetchall()
+    with conn:
+        for r in rows:
+            conn.execute(
+                "DELETE FROM reminders WHERE dish_id = ? AND kind = ?", (r["dish_id"], r["kind"])
+            )
+    return [(get_dish(conn, r["dish_id"]), r["kind"]) for r in rows]
