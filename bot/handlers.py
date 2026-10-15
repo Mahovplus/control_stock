@@ -257,6 +257,27 @@ def make_router(
         # Напишите /chatid в группе официантов, чтобы узнать число для .env
         await message.answer(f"ID этого чата: {message.chat.id}")
 
+    @router.message(Command("testchat"))
+    async def test_chat(message: Message) -> None:
+        # Проверка чата официантов без продаж: пробное сообщение и понятный ответ су-шефу
+        if waiters_chat_id is None:
+            await message.answer(
+                "WAITERS_CHAT_ID не задан. Бот читает только файл .env (не .env.example): "
+                "допишите туда строку WAITERS_CHAT_ID= и число из /chatid, потом перезапустите бота."
+            )
+            return
+        try:
+            await message.bot.send_message(
+                waiters_chat_id, "✅ Проверка связи: бот остатков пишет в этот чат."
+            )
+        except TelegramAPIError as e:
+            await message.answer(
+                f"Не смог написать в чат {waiters_chat_id}. Ответ Telegram: {e.message}\n"
+                "Проверьте, что бот добавлен в группу и число совпадает с ответом /chatid в группе."
+            )
+            return
+        await message.answer(f"Отправил пробное сообщение в чат {waiters_chat_id}. Проверьте группу.")
+
     @router.message(CommandStart())
     @router.message(Command("help"))
     async def start(message: Message, state: FSMContext) -> None:

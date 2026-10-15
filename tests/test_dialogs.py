@@ -354,3 +354,11 @@ def test_rename_and_delete_dish_with_confirmation():
     assert stock.list_dishes(h.conn) != []
     assert "Удалил" in h.press(f"delok:{dish.id}")[0]
     assert "Список пуст" in h.say(BTN_LIST)[0]
+
+
+def test_testchat_reports_missing_or_sent():
+    assert "WAITERS_CHAT_ID не задан" in Harness(waiters=None).say("/testchat")[0]
+    h = Harness()
+    out = h.say("/testchat")
+    assert h.to_waiters() == ["✅ Проверка связи: бот остатков пишет в этот чат."]
+    assert "Отправил пробное сообщение" in out[-1]
