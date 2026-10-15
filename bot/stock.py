@@ -1,7 +1,7 @@
 """Логика остатков без Telegram и без iiko.
 
 Здесь только правила из logika-bota.md (разделы 3, 5, 6, 7 и 7в), чтобы их можно было
-проверить тестами. Telegram-кнопки (handlers.py) лишь вызывают эти функции.
+проверить тестами (плюс раздел 14: настройки, переименование, удаление). Telegram-кнопки (handlers.py) лишь вызывают эти функции.
 """
 
 import sqlite3
@@ -9,12 +9,18 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 MAX_PORTIONS = 999  # защита от опечатки вроде «1000» вместо «10»
-LOW_STOCK = 3       # раздел 5: один порог для всех порционных блюд
+LOW_STOCK = 3       # раздел 5: порог для порционных блюд по умолчанию (меняется в настройках)
 LOW_PIECES = 1      # раздел 7в: для штучных весовых — «остался 1 кусок»
 MAX_GRAMS = 5000    # кусок тяжелее 5 кг — скорее всего опечатка
 PORTION, WEIGHT = "portion", "weight"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
-REMIND_AFTER = timedelta(minutes=15)  # раздел 6: су-шеф занят, напоминаем один раз
+REMIND_MINUTES = 15  # раздел 6: су-шеф занят, напоминаем один раз (меняется в настройках)
+
+# Раздел 14: что су-шеф может поменять кнопками. Значение по умолчанию и варианты.
+SETTINGS = {
+    "low_stock": (LOW_STOCK, (2, 3, 4, 5)),
+    "remind_minutes": (REMIND_MINUTES, (10, 15, 20, 30)),
+}
 
 
 class StockError(ValueError):
@@ -29,10 +35,7 @@ class Dish:
     in_work: int
     in_stop: bool
     kind: str = PORTION
-
-    @property
-    def low_stock(self) -> int:
-        return LOW_PIECES if self.kind == WEIGHT else LOW_STOCK
+    low_stock: int = LOW_STOCK  # «осталось мало»: для весовых всегда LOW_PIECES
 
 
 @dataclass
@@ -45,10 +48,29 @@ class SaleResult:
     ran_out: bool = False    # стало 0, блюдо ушло в стоп
 
 
-def _to_dish(row: sqlite3.Row) -> Dish:
+def _to_dish(conn: sqlite3.Connection, row: sqlite3.Row) -> Dish:
+    low = LOW_PIECES if row["kind"] == WEIGHT else get_setting(conn, "low_stock")
     return Dish(
-        row["id"], row["name"], row["free"], row["in_work"], bool(row["in_stop"]), row["kind"]
+        row["id"], row["name"], row["free"], row["in_work"], bool(row["in_stop"]), row["kind"], low
     )
+
+
+# --- Настройки кнопками (раздел 14) ---------------------------------------
+
+def get_setting(conn: sqlite3.Connection, key: str) -> int:
+    row = conn.execute("SELECT value FROM settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else SETTINGS[key][0]
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: int, who: str) -> None:
+    """Меняет настройку. Принимает только варианты с кнопок, чтобы не было опечаток."""
+    if key not in SETTINGS or value not in SETTINGS[key][1]:
+        raise StockError("Такого значения нет среди вариантов.")
+    with conn:
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value, changed_by) VALUES (?, ?, ?)",
+            (key, value, who),
+        )
 
 
 def add_dish(conn: sqlite3.Connection, name: str, kind: str = PORTION) -> Dish:
@@ -71,12 +93,54 @@ def get_dish(conn: sqlite3.Connection, dish_id: int) -> Dish:
     row = conn.execute("SELECT * FROM dishes WHERE id = ?", (dish_id,)).fetchone()
     if row is None:
         raise StockError("Такого блюда нет в списке.")
-    return _to_dish(row)
+    return _to_dish(conn, row)
 
 
 def list_dishes(conn: sqlite3.Connection) -> list[Dish]:
-    rows = conn.execute("SELECT * FROM dishes ORDER BY name").fetchall()
-    return [_to_dish(r) for r in rows]
+    """Блюда на контроле. Удалённые (архив) не показываем."""
+    rows = conn.execute("SELECT * FROM dishes WHERE archived = 0 ORDER BY name").fetchall()
+    return [_to_dish(conn, r) for r in rows]
+
+
+def rename_dish(conn: sqlite3.Connection, dish_id: int, new_name: str, who: str) -> Dish:
+    """Переименование. Остатки и история остаются у того же блюда."""
+    new_name = new_name.strip()
+    if not new_name:
+        raise StockError("Название пустое. Напишите новое название.")
+    old = get_dish(conn, dish_id)
+    try:
+        with conn:
+            conn.execute("UPDATE dishes SET name = ? WHERE id = ?", (new_name, dish_id))
+            conn.execute(
+                "INSERT INTO journal (dish_id, action, delta, free_after, who, comment) "
+                "VALUES (?, 'rename', 0, ?, ?, ?)",
+                (dish_id, old.free, who, f"было «{old.name}»"),
+            )
+    except sqlite3.IntegrityError:
+        raise StockError(f"«{new_name}» уже есть в списке.") from None
+    return get_dish(conn, dish_id)
+
+
+def archive_dish(conn: sqlite3.Connection, dish_id: int, who: str) -> Dish:
+    """Удаление блюда из контроля. Строку не стираем: журнал продаж ссылается на неё.
+
+    Блюдо прячется из списков, таймеры и напоминания по нему снимаются, а к названию
+    добавляется «[удалено N]», чтобы потом можно было завести блюдо с тем же именем.
+    """
+    dish = get_dish(conn, dish_id)
+    with conn:
+        conn.execute(
+            "UPDATE dishes SET archived = 1, iiko_id = NULL, name = ? WHERE id = ?",
+            (f"{dish.name} [удалено {dish_id}]", dish_id),
+        )
+        conn.execute("DELETE FROM timers WHERE dish_id = ?", (dish_id,))
+        conn.execute("DELETE FROM reminders WHERE dish_id = ?", (dish_id,))
+        conn.execute(
+            "INSERT INTO journal (dish_id, action, delta, free_after, who, comment) "
+            "VALUES (?, 'archive', 0, ?, ?, ?)",
+            (dish_id, dish.free, who, f"удалено «{dish.name}», свободно было {dish.free}"),
+        )
+    return dish
 
 
 def parse_count(text: str, allow_zero: bool) -> int:
@@ -235,11 +299,12 @@ def take_due_timers(conn: sqlite3.Connection, now: datetime) -> list[Dish]:
 # --- Напоминание, если су-шеф не ответил (раздел 6) -----------------------
 
 def set_reminder(conn: sqlite3.Connection, dish_id: int, kind: str, now: datetime) -> None:
-    """Через 15 минут напомнить один раз. kind: eta (время) или ready (готово?)."""
+    """Через N минут (настройка, обычно 15) напомнить один раз. kind: eta или ready."""
+    due = now + timedelta(minutes=get_setting(conn, "remind_minutes"))
     with conn:
         conn.execute(
             "INSERT OR REPLACE INTO reminders (dish_id, kind, due_at) VALUES (?, ?, ?)",
-            (dish_id, kind, (now + REMIND_AFTER).strftime(TIME_FORMAT)),
+            (dish_id, kind, due.strftime(TIME_FORMAT)),
         )
 
 

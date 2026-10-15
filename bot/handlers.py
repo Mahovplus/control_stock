@@ -1,4 +1,4 @@
-"""Кнопки и диалоги су-шефа в Telegram (разделы 5, 6 и 7 logika-bota.md).
+"""Кнопки и диалоги су-шефа в Telegram (разделы 5, 6, 7 и 14 logika-bota.md).
 
 Каждый обработчик только разговаривает с человеком, а считает stock.py.
 """
@@ -30,32 +30,48 @@ BTN_REPLENISH = "➕ Пополнить"
 BTN_RECOUNT = "🔄 Утренний пересчёт"
 BTN_ADD = "🍽 Добавить блюдо"
 BTN_SALE = "🧾 Продажа (тест)"  # пока iiko не подключена, продажу вводим руками
+BTN_SETTINGS = "⚙️ Настройки"
 
 WELCOME_PICTURE = Path(__file__).resolve().parent.parent / "assets" / "welcome.png"
 
-# Подпись к картинке в Telegram: не больше 1024 символов (проверяет тест)
-WELCOME_TEXT = f"""Здравствуйте, шеф! 👋
+
+def portions_word(n: int) -> str:
+    """1 порция, 2 порции, 5 порций."""
+    if n % 10 == 1 and n % 100 != 11:
+        return "порция"
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return "порции"
+    return "порций"
+
+
+def welcome_text(low: int = stock.LOW_STOCK, minutes: int = stock.REMIND_MINUTES) -> str:
+    """Памятка. Цифры берём из настроек. Подпись к фото: не больше 1024 символов (тест)."""
+    return f"""Здравствуйте, шеф! 👋
 Я помощник кухни: считаю порционные блюда, чтобы гостю не сказали «уже закончилось».
 
 Кнопки:
-• {BTN_LIST}: сколько порций свободно и сколько в работе.
+• {BTN_LIST}: сколько свободно и сколько в работе.
 • {BTN_REPLENISH}: приготовили партию, добавьте порции. Блюдо выйдет из стопа.
 • {BTN_RECOUNT}: спрошу факт по каждому блюду и покажу расхождения.
 • {BTN_ADD}: порционное или штучное весовое, где у каждого куска свой вес.
+• {BTN_SETTINGS}: порог, напоминание, правка и удаление блюд.
 
 Сам слежу и пишу:
-• Осталось 3 порции: предупрежу один раз.
+• Осталось {low} {portions_word(low)}: предупрежу один раз.
 • 0 порций: ставлю в стоп и сразу пишу официантам. Вам одна кнопка: через сколько будет.
-• Заняты и не ответили: через 15 минут напомню один раз.
+• Не ответили: через {minutes} минут напомню один раз.
 • Время вышло: спрошу «Готово?». «Да» вернёт блюдо в продажу.
 • Пробили, а порций нет: срочно напишу вам и официантам.
 
 Важно:
-• Отвечаю только су-шефу.
+• Отвечаю только су-шефам из списка.
 • Остаток не уходит ниже 0, решение всегда за вами.
 • Пока iiko не подключена, стоп в iiko ставьте вручную, а продажи для проверки вводите кнопкой «{BTN_SALE}».
 
-Эта памятка всегда по команде /help."""
+Памятка всегда по команде /help."""
+
+
+WELCOME_TEXT = welcome_text()  # с настройками по умолчанию
 
 HOURS = (1, 2, 3)  # раздел 6: через сколько блюдо вернётся
 
@@ -63,7 +79,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
     keyboard=[
         [KeyboardButton(text=BTN_LIST), KeyboardButton(text=BTN_REPLENISH)],
         [KeyboardButton(text=BTN_RECOUNT), KeyboardButton(text=BTN_ADD)],
-        [KeyboardButton(text=BTN_SALE)],
+        [KeyboardButton(text=BTN_SALE), KeyboardButton(text=BTN_SETTINGS)],
     ],
     resize_keyboard=True,
 )
@@ -76,6 +92,7 @@ class Dialog(StatesGroup):
     add_kind = State()        # ждём тип: порционное или штучное весовое
     replenish_qty = State()   # ждём, сколько порций добавить
     recount_qty = State()     # ждём фактическое число при пересчёте
+    rename_name = State()     # ждём новое название блюда
 
 
 def format_stock(dishes: list[stock.Dish], pieces: dict[int, list[int]] | None = None) -> str:
@@ -158,11 +175,28 @@ def stop_text(name: str) -> str:
     )
 
 
-async def notify_waiters(bot: Bot, waiters_chat_id: int | None, sous_chef_id: int, text: str) -> None:
-    """Пишет в чат официантов. Если не вышло, говорит об этом су-шефу, а не молчит."""
+def as_ids(sous_chef_ids: int | list[int]) -> list[int]:
+    """Один ID или список ID су-шефов → список."""
+    return [sous_chef_ids] if isinstance(sous_chef_ids, int) else list(sous_chef_ids)
+
+
+async def send_to_chefs(bot: Bot, chef_ids: list[int], text: str, **kwargs) -> None:
+    """Пишет всем су-шефам. Кто ещё не нажал Start, тому Telegram не даст написать:
+    это не должно мешать остальным."""
+    for chef in chef_ids:
+        try:
+            await bot.send_message(chef, text, **kwargs)
+        except TelegramAPIError as e:
+            logging.warning("Не смог написать су-шефу %s: %s", chef, e)
+
+
+async def notify_waiters(bot: Bot, waiters_chat_id: int | None, sous_chef_ids, text: str) -> None:
+    """Пишет в чат официантов. Если не вышло, говорит об этом су-шефам, а не молчит."""
+    chefs = as_ids(sous_chef_ids)
     if waiters_chat_id is None:
-        await bot.send_message(
-            sous_chef_id,
+        await send_to_chefs(
+            bot,
+            chefs,
             "Чат официантов не настроен, им я не написал. "
             "Как настроить: WAITERS_CHAT_ID в файле .env.",
         )
@@ -171,31 +205,51 @@ async def notify_waiters(bot: Bot, waiters_chat_id: int | None, sous_chef_id: in
         await bot.send_message(waiters_chat_id, text)
     except TelegramAPIError as e:
         logging.warning("Не смог написать в чат официантов: %s", e)
-        await bot.send_message(
-            sous_chef_id,
+        await send_to_chefs(
+            bot,
+            chefs,
             "Не смог написать в чат официантов. Проверьте, что бот добавлен в группу "
             "и WAITERS_CHAT_ID в .env верный.",
         )
 
 
+def settings_keyboard(low: int, minutes: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text=f"Порог «осталось мало»: {low}", callback_data="set:low_stock")],
+        [InlineKeyboardButton(text=f"Напоминание через: {minutes} мин", callback_data="set:remind_minutes")],
+        [InlineKeyboardButton(text="✏️ Переименовать блюдо", callback_data="set:rename")],
+        [InlineKeyboardButton(text="🗑 Удалить блюдо", callback_data="set:delete")],
+    ])
+
+
+SETTING_NAMES = {
+    "low_stock": ("Порог «осталось мало» для порционных блюд", "порц."),
+    "remind_minutes": ("Через сколько минут напомнить, если не ответили", "мин"),
+}
+
+
 def make_router(
-    conn: sqlite3.Connection, sous_chef_id: int, waiters_chat_id: int | None = None
+    conn: sqlite3.Connection, sous_chef_ids: int | list[int], waiters_chat_id: int | None = None
 ) -> Router:
     router = Router()
-    # Бот отвечает только су-шефу (раздел 2). Остальных просто не слышит.
-    router.message.filter(F.from_user.id == sous_chef_id)
-    router.callback_query.filter(F.from_user.id == sous_chef_id)
+    chefs = as_ids(sous_chef_ids)
+    # Бот отвечает только су-шефам из списка (разделы 2 и 14). Остальных просто не слышит.
+    router.message.filter(F.from_user.id.in_(chefs))
+    router.callback_query.filter(F.from_user.id.in_(chefs))
 
     def who(user_id: int) -> str:
         return str(user_id)
 
     async def to_waiters(bot: Bot, text: str) -> None:
-        await notify_waiters(bot, waiters_chat_id, sous_chef_id, text)
+        await notify_waiters(bot, waiters_chat_id, chefs, text)
 
     async def went_to_stop(message: Message, dish: stock.Dish) -> None:
-        """Раздел 6: официанты узнают сразу, су-шефу одно сообщение с кнопками."""
+        """Раздел 6: официанты узнают сразу, су-шефам одно сообщение с кнопками.
+        Пишем всем су-шефам: время выберет тот, кто свободен."""
         await to_waiters(message.bot, f"⛔ {dish.name} в стопе. Когда вернётся, сообщу.")
-        await message.answer(stop_text(dish.name), reply_markup=eta_keyboard(dish.id))
+        await send_to_chefs(
+            message.bot, chefs, stop_text(dish.name), reply_markup=eta_keyboard(dish.id)
+        )
         stock.set_reminder(conn, dish.id, "eta", datetime.now())
 
     @router.message(Command("chatid"))
@@ -207,12 +261,15 @@ def make_router(
     @router.message(Command("help"))
     async def start(message: Message, state: FSMContext) -> None:
         await state.clear()
+        text = welcome_text(
+            stock.get_setting(conn, "low_stock"), stock.get_setting(conn, "remind_minutes")
+        )
         if WELCOME_PICTURE.exists():
             await message.answer_photo(
-                FSInputFile(WELCOME_PICTURE), caption=WELCOME_TEXT, reply_markup=MAIN_MENU
+                FSInputFile(WELCOME_PICTURE), caption=text, reply_markup=MAIN_MENU
             )
         else:  # картинку случайно удалили: памятка всё равно нужна
-            await message.answer(WELCOME_TEXT, reply_markup=MAIN_MENU)
+            await message.answer(text, reply_markup=MAIN_MENU)
 
     def stock_text() -> str:
         dishes = stock.list_dishes(conn)
@@ -460,10 +517,12 @@ def make_router(
         """Уведомления раздела 5 после одной продажи."""
         dish = result.dish
         if result.oversold:
-            await message.answer(
+            await send_to_chefs(
+                message.bot,
+                chefs,
                 f"🚨 Шеф, {dish.name} пробили, а порций нет. Остаток остаётся 0.\n"
                 "Решите, что делать. Если сделаете порцию, добавьте её кнопкой "
-                f"«{BTN_REPLENISH}»: она закроет этот заказ."
+                f"«{BTN_REPLENISH}»: она закроет этот заказ.",
             )
             await to_waiters(message.bot, f"🚨 {dish.name} пробили, а порций нет. Подойдите к су-шефу.")
             return
@@ -471,9 +530,13 @@ def make_router(
         if result.low_alert:
             if dish.kind == stock.WEIGHT:
                 left = ", ".join(f"{g} г" for _, g in stock.free_pieces(conn, dish.id))
-                await message.answer(f"⚠️ Шеф, {dish.name}: остался {dish.free} кусок ({left}).")
+                await send_to_chefs(
+                    message.bot, chefs, f"⚠️ Шеф, {dish.name}: остался {dish.free} кусок ({left})."
+                )
             else:
-                await message.answer(f"⚠️ Шеф, {dish.name}: осталось {dish.free} порции.")
+                await send_to_chefs(
+                    message.bot, chefs, f"⚠️ Шеф, {dish.name}: осталось {dish.free} {portions_word(dish.free)}."
+                )
         if result.ran_out:
             await went_to_stop(message, dish)
 
@@ -506,5 +569,114 @@ def make_router(
                 f"{dish.name}: через сколько будет?", reply_markup=eta_keyboard(dish.id)
             )
             stock.set_reminder(conn, dish.id, "eta", datetime.now())
+
+    # --- Настройки, переименование, удаление (раздел 14) -------------------
+    async def show_settings(message: Message) -> None:
+        await message.answer(
+            "Настройки. Нажмите, что поменять.",
+            reply_markup=settings_keyboard(
+                stock.get_setting(conn, "low_stock"), stock.get_setting(conn, "remind_minutes")
+            ),
+        )
+
+    @router.message(F.text == BTN_SETTINGS)
+    async def settings_open(message: Message, state: FSMContext) -> None:
+        await state.clear()
+        await show_settings(message)
+
+    @router.callback_query(F.data.in_({"set:low_stock", "set:remind_minutes"}))
+    async def setting_pick(call: CallbackQuery) -> None:
+        await call.answer()
+        key = call.data.split(":")[1]
+        title, unit = SETTING_NAMES[key]
+        now = stock.get_setting(conn, key)
+        row = [
+            InlineKeyboardButton(
+                text=f"{'✅ ' if v == now else ''}{v}", callback_data=f"setv:{key}:{v}"
+            )
+            for v in stock.SETTINGS[key][1]
+        ]
+        await call.message.answer(
+            f"{title}. Сейчас {now} {unit}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[row])
+        )
+
+    @router.callback_query(F.data.startswith("setv:"))
+    async def setting_value(call: CallbackQuery) -> None:
+        await call.answer()
+        _, key, value = call.data.split(":")
+        try:
+            stock.set_setting(conn, key, int(value), who(call.from_user.id))
+        except (stock.StockError, ValueError):
+            await call.message.answer("Такого значения нет среди вариантов.")
+            return
+        title, unit = SETTING_NAMES[key]
+        await call.message.answer(f"Готово. {title}: {value} {unit}")
+
+    @router.callback_query(F.data.in_({"set:rename", "set:delete"}))
+    async def dish_manage_pick(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        await state.clear()
+        dishes = stock.list_dishes(conn)
+        if not dishes:
+            await call.message.answer(format_stock(dishes))
+            return
+        rename = call.data == "set:rename"
+        await call.message.answer(
+            "Какое блюдо переименовать?" if rename else "Какое блюдо удалить из контроля?",
+            reply_markup=dishes_keyboard(dishes, "ren" if rename else "del"),
+        )
+
+    @router.callback_query(F.data.startswith("ren:"))
+    async def rename_start(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        dish = stock.get_dish(conn, int(call.data.split(":")[1]))
+        await state.set_state(Dialog.rename_name)
+        await state.update_data(dish_id=dish.id)
+        await call.message.answer(f"Новое название для «{dish.name}»? Остатки сохранятся.")
+
+    @router.message(Dialog.rename_name, F.text)
+    async def rename_finish(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        try:
+            old = stock.get_dish(conn, data["dish_id"])
+            dish = stock.rename_dish(conn, old.id, message.text, who(message.from_user.id))
+        except stock.StockError as e:
+            await message.answer(str(e))  # диалог не сбрасываем: можно написать другое
+            return
+        await state.clear()
+        await message.answer(f"Готово: «{old.name}» теперь «{dish.name}».")
+
+    @router.callback_query(F.data.startswith("del:"))
+    async def delete_ask(call: CallbackQuery) -> None:
+        await call.answer()
+        dish = stock.get_dish(conn, int(call.data.split(":")[1]))
+        warn = ""
+        if dish.free or dish.in_work:
+            warn = (
+                f"\nВ боте ещё есть: свободно {dish.free}, в работе {dish.in_work}. "
+                "После удаления бот перестанет их считать."
+            )
+        await call.message.answer(
+            f"Удалить «{dish.name}» из контроля? История в журнале сохранится.{warn}",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="Да, удалить", callback_data=f"delok:{dish.id}"),
+                InlineKeyboardButton(text="Нет", callback_data="delno"),
+            ]]),
+        )
+
+    @router.callback_query(F.data.startswith("delok:"))
+    async def delete_confirm(call: CallbackQuery) -> None:
+        await call.answer()
+        try:
+            dish = stock.archive_dish(conn, int(call.data.split(":")[1]), who(call.from_user.id))
+        except stock.StockError as e:
+            await call.message.answer(str(e))
+            return
+        await call.message.answer(f"Удалил «{dish.name}» из контроля.")
+
+    @router.callback_query(F.data == "delno")
+    async def delete_cancel(call: CallbackQuery) -> None:
+        await call.answer()
+        await call.message.answer("Хорошо, ничего не удаляю.")
 
     return router

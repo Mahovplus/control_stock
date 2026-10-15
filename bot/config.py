@@ -6,11 +6,13 @@
 import os
 from dataclasses import dataclass
 
+MAX_CHEFS = 4
+
 
 @dataclass
 class Config:
     bot_token: str
-    sous_chef_id: int
+    sous_chef_ids: list[int]  # 1–4 су-шефа (раздел 14)
     db_path: str
     waiters_chat_id: int | None = None  # чат официантов; пусто = не настроен
 
@@ -31,14 +33,19 @@ def load_config() -> Config:
     load_env_file()
     token = os.environ.get("BOT_TOKEN", "")
     chef = os.environ.get("SOUS_CHEF_ID", "")
+    # Несколько су-шефов через запятую: 111111111,222222222
+    chefs = [c.strip() for c in chef.split(",") if c.strip()]
     # Говорим точно, что не так: человеку без опыта так проще найти ошибку
     problems = []
     if not token:
         problems.append("BOT_TOKEN пустой: впишите токен от @BotFather")
-    if not chef.isdigit():
+    if not chefs or not all(c.isdigit() for c in chefs):
         problems.append(
-            f"SOUS_CHEF_ID должен быть числом из @userinfobot, сейчас там: «{chef}»"
+            "SOUS_CHEF_ID должен быть числом из @userinfobot "
+            f"(несколько су-шефов через запятую), сейчас там: «{chef}»"
         )
+    elif len(chefs) > MAX_CHEFS:
+        problems.append(f"SOUS_CHEF_ID: не больше {MAX_CHEFS} су-шефов, сейчас {len(chefs)}")
     waiters = os.environ.get("WAITERS_CHAT_ID", "")
     if waiters and not waiters.lstrip("-").isdigit():
         problems.append(
@@ -50,7 +57,7 @@ def load_config() -> Config:
         raise SystemExit("Не могу запустить бота:\n- " + "\n- ".join(problems))
     return Config(
         token,
-        int(chef),
+        [int(c) for c in dict.fromkeys(chefs)],  # повтор одного ID не считаем
         os.environ.get("DB_PATH", "data/ostatki.db"),
         int(waiters) if waiters else None,
     )

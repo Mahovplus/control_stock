@@ -80,7 +80,7 @@ def test_format_stock_shows_stop(conn):
 
 
 def test_router_builds(conn):
-    assert make_router(conn, sous_chef_id=123) is not None
+    assert make_router(conn, [123, 456]) is not None
 
 
 def test_config_explains_wrong_chef_id(tmp_path, monkeypatch):
@@ -105,7 +105,23 @@ def test_config_reads_env_with_spaces(tmp_path, monkeypatch):
     monkeypatch.delenv("BOT_TOKEN", raising=False)
     monkeypatch.delenv("SOUS_CHEF_ID", raising=False)
     cfg = load_config()
-    assert (cfg.bot_token, cfg.sous_chef_id) == ("1:abc", 123)
+    assert (cfg.bot_token, cfg.sous_chef_ids) == ("1:abc", [123])
+
+
+def test_config_reads_several_chefs(tmp_path, monkeypatch):
+    from bot.config import load_config
+
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / ".env").write_text("BOT_TOKEN=1:abc\nSOUS_CHEF_ID=123, 456,123\n", encoding="utf-8")
+    monkeypatch.delenv("BOT_TOKEN", raising=False)
+    monkeypatch.delenv("SOUS_CHEF_ID", raising=False)
+    assert load_config().sous_chef_ids == [123, 456]  # повтор убран
+
+    (tmp_path / ".env").write_text("BOT_TOKEN=1:abc\nSOUS_CHEF_ID=1,2,3,4,5\n", encoding="utf-8")
+    monkeypatch.delenv("SOUS_CHEF_ID", raising=False)
+    with pytest.raises(SystemExit) as e:
+        load_config()
+    assert "не больше 4" in str(e.value)
 
 
 def test_sale_moves_portion_to_work_and_alerts_once(conn):
@@ -224,3 +240,60 @@ def test_portion_dish_refuses_pieces(conn):
     dish = stock.add_dish(conn, "Вителло тоннато")
     with pytest.raises(stock.StockError):
         stock.add_pieces(conn, dish.id, [500], who="1")
+
+
+def test_rename_keeps_stock_and_checks_duplicates(conn):
+    a = stock.add_dish(conn, "Тирамису")
+    stock.add_dish(conn, "Панна котта")
+    stock.replenish(conn, a.id, 5, "1")
+    assert stock.rename_dish(conn, a.id, " Тирамису классик ", "1").name == "Тирамису классик"
+    assert stock.get_dish(conn, a.id).free == 5
+    with pytest.raises(stock.StockError, match="уже есть"):
+        stock.rename_dish(conn, a.id, "Панна котта", "1")
+
+
+def test_archived_dish_hidden_and_name_free_again(conn):
+    a = stock.add_dish(conn, "Тирамису")
+    stock.replenish(conn, a.id, 2, "1")
+    stock.set_timer(conn, a.id, 1, datetime(2026, 1, 1, 12))
+    stock.archive_dish(conn, a.id, "1")
+    assert stock.list_dishes(conn) == []
+    assert stock.take_due_timers(conn, datetime(2026, 1, 2)) == []  # таймер снят
+    assert stock.add_dish(conn, "Тирамису").id != a.id  # имя можно занять снова
+    last = conn.execute("SELECT action, comment FROM journal WHERE dish_id = ? ORDER BY id DESC", (a.id,)).fetchone()
+    assert last["action"] == "archive" and "свободно было 2" in last["comment"]
+
+
+def test_settings_change_threshold_and_reminder(conn):
+    a = stock.add_dish(conn, "Тирамису")
+    assert stock.get_setting(conn, "low_stock") == 3
+    stock.set_setting(conn, "low_stock", 5, "1")
+    stock.replenish(conn, a.id, 6, "1")
+    assert stock.sell(conn, a.id, "1").low_alert  # 5 — уже «мало»
+    with pytest.raises(stock.StockError):
+        stock.set_setting(conn, "low_stock", 50, "1")  # только варианты с кнопок
+    stock.set_setting(conn, "remind_minutes", 30, "1")
+    now = datetime(2026, 1, 1, 12)
+    stock.set_reminder(conn, a.id, "eta", now)
+    assert stock.take_due_reminders(conn, now + timedelta(minutes=29)) == []
+    assert len(stock.take_due_reminders(conn, now + timedelta(minutes=30))) == 1
+
+
+def test_daily_backup_once_a_day_keeps_14(tmp_path):
+    from datetime import date
+
+    from bot.backup import KEEP_DAYS, daily_backup
+
+    conn = connect(str(tmp_path / "ostatki.db"))
+    stock.add_dish(conn, "Тирамису")
+    folder = tmp_path / "backup"
+    first = daily_backup(conn, folder, date(2026, 10, 1))
+    assert first.name == "ostatki-2026-10-01.db"
+    assert daily_backup(conn, folder, date(2026, 10, 1)) is None  # второй раз за день не копирует
+    copy = sqlite3.connect(first)
+    assert copy.execute("SELECT name FROM dishes").fetchone()[0] == "Тирамису"
+    copy.close()
+    for day in range(2, 21):
+        daily_backup(conn, folder, date(2026, 10, day))
+    names = sorted(p.name for p in folder.glob("ostatki-*.db"))
+    assert len(names) == KEEP_DAYS and names[0] == "ostatki-2026-10-07.db"
