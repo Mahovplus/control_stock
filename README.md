@@ -37,7 +37,7 @@ iiko появится на следующих шагах. Пока стоп в i
 
 ```bash
 python3 -m pip install -r requirements.txt
-cp .env.example .env      # вписать BOT_TOKEN и SOUS_CHEF_ID
+cp .env.example .env      # вписать BOT_TOKEN и SOUS_CHEF_ID (до 4 ID через запятую)
 python3 -m bot.main
 ```
 

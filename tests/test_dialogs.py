@@ -14,7 +14,15 @@ from aiogram.types import CallbackQuery, Chat, Message, Update, User
 
 from bot import stock
 from bot.db import connect
-from bot.handlers import BTN_ADD, BTN_RECOUNT, BTN_REPLENISH, BTN_SALE, make_router
+from bot.handlers import (
+    BTN_ADD,
+    BTN_LIST,
+    BTN_RECOUNT,
+    BTN_REPLENISH,
+    BTN_SALE,
+    BTN_SETTINGS,
+    make_router,
+)
 from bot.timers import ask_due
 
 CHEF = 111
@@ -54,12 +62,13 @@ class FakeSession(BaseSession):
 
 
 class Harness:
-    def __init__(self, waiters=WAITERS):
+    def __init__(self, waiters=WAITERS, chefs=(CHEF,)):
         self.conn = connect(":memory:")
         self.session = FakeSession()
         self.bot = Bot("42:TEST", session=self.session)
         self.dp = Dispatcher()
-        self.dp.include_router(make_router(self.conn, CHEF, waiters))
+        self.chefs = list(chefs)
+        self.dp.include_router(make_router(self.conn, self.chefs, waiters))
         self.n = 0
 
     def to_waiters(self) -> list[str]:
@@ -68,7 +77,7 @@ class Harness:
     def tick(self, now) -> list[str]:
         """Как будто часы дошли до now: срабатывают таймеры."""
         before = len(self.session.sent)
-        asyncio.run(ask_due(self.bot, self.conn, CHEF, now))
+        asyncio.run(ask_due(self.bot, self.conn, self.chefs, now))
         return self.session.sent[before:]
 
     def _msg(self, text, user_id):
@@ -294,3 +303,54 @@ def test_weight_dish_recount_marks_missing_piece():
     out = h.press("rcok")
     assert "Пересчёт закончен" in out[0] and "нет куска 620 г" in out[0]
     assert [g for _, g in stock.free_pieces(h.conn, dish.id)] == [550]
+
+
+SECOND = 333  # второй су-шеф
+
+
+def test_two_chefs_both_work_and_both_hear_about_stop():
+    h = Harness(chefs=[CHEF, SECOND])
+    h.say(BTN_ADD, user_id=SECOND)
+    h.say("Тирамису", user_id=SECOND)
+    h.press("kind:portion", user_id=SECOND)
+    dish = stock.list_dishes(h.conn)[0]
+    h.press(f"rep:{dish.id}")
+    h.say("1")
+    assert h.say(BTN_LIST, user_id=STRANGER) == []  # чужой по-прежнему не слышен
+    h.say(BTN_SALE)
+    before = len(h.session.sent)
+    h.press(f"sale:{dish.id}")
+    stop = [c for t, c in zip(h.session.sent[before:], h.session.chats[before:]) if "закончилось" in t]
+    assert sorted(stop) == [CHEF, SECOND]  # время выберет тот, кто свободен
+    out = h.tick(datetime.now() + timedelta(minutes=16))
+    assert len(out) == 2 and all("Напоминаю" in t for t in out)
+
+
+def test_settings_buttons_change_threshold_and_welcome():
+    h = Harness()
+    assert "Настройки" in h.say(BTN_SETTINGS)[0]
+    assert "Сейчас 3" in h.press("set:low_stock")[0]
+    assert "Готово" in h.press("setv:low_stock:5")[0]
+    assert stock.get_setting(h.conn, "low_stock") == 5
+    h.press("setv:remind_minutes:30")
+    assert stock.get_setting(h.conn, "remind_minutes") == 30
+    assert "нет среди вариантов" in h.press("setv:low_stock:99")[0]
+    welcome = h.say("/help")[0]
+    assert "Осталось 5 порций" in welcome and "через 30 минут" in welcome
+
+
+def test_rename_and_delete_dish_with_confirmation():
+    h = Harness()
+    _dish_with(h, 2)
+    dish = stock.list_dishes(h.conn)[0]
+    h.say(BTN_SETTINGS)
+    assert "переименовать" in h.press("set:rename")[0]
+    h.press(f"ren:{dish.id}")
+    assert "теперь «Тирамису классик»" in h.say("Тирамису классик")[0]
+    h.press("set:delete")
+    ask = h.press(f"del:{dish.id}")[0]
+    assert "Удалить «Тирамису классик»" in ask and "свободно 2" in ask
+    assert "ничего не удаляю" in h.press("delno")[0]
+    assert stock.list_dishes(h.conn) != []
+    assert "Удалил" in h.press(f"delok:{dish.id}")[0]
+    assert "Список пуст" in h.say(BTN_LIST)[0]

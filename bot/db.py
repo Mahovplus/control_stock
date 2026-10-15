@@ -6,7 +6,8 @@
 - oversells: пробили сверх остатка, ждём решения су-шефа (раздел 5);
 - timers: когда спросить су-шефа «готово?» (раздел 6);
 - reminders: одно напоминание су-шефу, если он не ответил (раздел 6);
-- pieces: куски штучных весовых блюд, у каждого свой вес (раздел 7в).
+- pieces: куски штучных весовых блюд, у каждого свой вес (раздел 7в);
+- settings: порог и время напоминания, которые су-шеф поменял кнопками (раздел 14).
 """
 
 import sqlite3
@@ -23,7 +24,8 @@ CREATE TABLE IF NOT EXISTS dishes (
     written_off INTEGER NOT NULL DEFAULT 0,
     in_stop     INTEGER NOT NULL DEFAULT 0,     -- 1 = блюдо в стоп-листе
     low_alerted INTEGER NOT NULL DEFAULT 0,     -- 1 = «осталось 3» уже отправили
-    kind        TEXT NOT NULL DEFAULT 'portion' -- portion = порционное, weight = штучное весовое
+    kind        TEXT NOT NULL DEFAULT 'portion', -- portion = порционное, weight = штучное весовое
+    archived    INTEGER NOT NULL DEFAULT 0      -- 1 = удалено из контроля, история осталась
 );
 
 CREATE TABLE IF NOT EXISTS journal (
@@ -63,6 +65,13 @@ CREATE TABLE IF NOT EXISTS pieces (
     state    TEXT NOT NULL DEFAULT 'free',  -- free, in_work, sold, written_off, lost
     added_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
+
+CREATE TABLE IF NOT EXISTS settings (
+    key        TEXT PRIMARY KEY,    -- low_stock, remind_minutes
+    value      INTEGER NOT NULL,
+    changed_by TEXT,
+    changed_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 # Колонки, добавленные после шага 1. У тех, у кого база уже создана,
@@ -71,6 +80,7 @@ NEW_COLUMNS = {
     "dishes": [
         ("low_alerted", "INTEGER NOT NULL DEFAULT 0"),
         ("kind", "TEXT NOT NULL DEFAULT 'portion'"),
+        ("archived", "INTEGER NOT NULL DEFAULT 0"),
     ],
 }
 
