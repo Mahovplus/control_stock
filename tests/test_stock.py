@@ -185,3 +185,42 @@ def test_config_reads_waiters_chat(tmp_path, monkeypatch):
     for key in ("BOT_TOKEN", "SOUS_CHEF_ID", "WAITERS_CHAT_ID"):
         monkeypatch.delenv(key, raising=False)
     assert load_config().waiters_chat_id == -100500
+
+
+@pytest.mark.parametrize("text, expected", [
+    ("550 620 480", [550, 620, 480]), ("0,550 0.62", [550, 620]), ("550; 600", [550, 600]),
+])
+def test_parse_weights(text, expected):
+    assert stock.parse_weights(text) == expected
+
+
+@pytest.mark.parametrize("text", ["", "пятьсот", "0", "6000", "-5"])
+def test_parse_weights_rejects(text):
+    with pytest.raises(stock.StockError):
+        stock.parse_weights(text)
+
+
+def test_pieces_keep_counters_in_sync(conn):
+    dish = stock.add_dish(conn, "Ребро телёнка", stock.WEIGHT)
+    stock.add_pieces(conn, dish.id, [550, 620, 480], who="1")
+    assert stock.get_dish(conn, dish.id).free == 3
+    assert stock.find_piece(conn, dish.id, 560) is None  # точного веса нет: спросим су-шефа
+    r = stock.sell_piece(conn, stock.find_piece(conn, dish.id, 620), who="1")
+    assert (r.dish.free, r.dish.in_work) == (2, 1)
+    assert [g for _, g in stock.free_pieces(conn, dish.id)] == [480, 550]
+    assert stock.recent_weights(conn, dish.id) == [480, 620, 550]
+
+
+def test_weight_oversell_then_piece_goes_to_work(conn):
+    dish = stock.add_dish(conn, "Ребро телёнка", stock.WEIGHT)
+    assert stock.sell(conn, dish.id, who="1").oversold  # пробили, а кусков нет
+    after = stock.add_pieces(conn, dish.id, [550, 600], who="1")
+    assert (after.free, after.in_work) == (1, 1)
+    states = [r[0] for r in conn.execute("SELECT state FROM pieces ORDER BY id")]
+    assert states == ["in_work", "free"]
+
+
+def test_portion_dish_refuses_pieces(conn):
+    dish = stock.add_dish(conn, "Вителло тоннато")
+    with pytest.raises(stock.StockError):
+        stock.add_pieces(conn, dish.id, [500], who="1")

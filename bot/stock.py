@@ -1,6 +1,6 @@
 """Логика остатков без Telegram и без iiko.
 
-Здесь только правила из logika-bota.md (разделы 3, 5, 6 и 7), чтобы их можно было
+Здесь только правила из logika-bota.md (разделы 3, 5, 6, 7 и 7в), чтобы их можно было
 проверить тестами. Telegram-кнопки (handlers.py) лишь вызывают эти функции.
 """
 
@@ -9,7 +9,10 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 MAX_PORTIONS = 999  # защита от опечатки вроде «1000» вместо «10»
-LOW_STOCK = 3       # раздел 5: один порог для всех блюд
+LOW_STOCK = 3       # раздел 5: один порог для всех порционных блюд
+LOW_PIECES = 1      # раздел 7в: для штучных весовых — «остался 1 кусок»
+MAX_GRAMS = 5000    # кусок тяжелее 5 кг — скорее всего опечатка
+PORTION, WEIGHT = "portion", "weight"
 TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
 REMIND_AFTER = timedelta(minutes=15)  # раздел 6: су-шеф занят, напоминаем один раз
 
@@ -25,6 +28,11 @@ class Dish:
     free: int
     in_work: int
     in_stop: bool
+    kind: str = PORTION
+
+    @property
+    def low_stock(self) -> int:
+        return LOW_PIECES if self.kind == WEIGHT else LOW_STOCK
 
 
 @dataclass
@@ -38,17 +46,22 @@ class SaleResult:
 
 
 def _to_dish(row: sqlite3.Row) -> Dish:
-    return Dish(row["id"], row["name"], row["free"], row["in_work"], bool(row["in_stop"]))
+    return Dish(
+        row["id"], row["name"], row["free"], row["in_work"], bool(row["in_stop"]), row["kind"]
+    )
 
 
-def add_dish(conn: sqlite3.Connection, name: str) -> Dish:
-    """Добавляет порционное блюдо в список контроля. Остаток начинается с 0."""
+def add_dish(conn: sqlite3.Connection, name: str, kind: str = PORTION) -> Dish:
+    """Добавляет блюдо в список контроля. Остаток начинается с 0.
+
+    kind: portion — порционное, weight — штучное весовое (раздел 7в).
+    """
     name = name.strip()
     if not name:
         raise StockError("Название пустое. Напиши, как блюдо называется в меню.")
     try:
         with conn:
-            cur = conn.execute("INSERT INTO dishes (name) VALUES (?)", (name,))
+            cur = conn.execute("INSERT INTO dishes (name, kind) VALUES (?, ?)", (name, kind))
     except sqlite3.IntegrityError:
         raise StockError(f"«{name}» уже есть в списке.") from None
     return get_dish(conn, cur.lastrowid)
@@ -102,7 +115,7 @@ def replenish(conn: sqlite3.Connection, dish_id: int, qty: int, who: str) -> Dis
             "in_stop = CASE WHEN ? > 0 THEN 0 ELSE in_stop END, "
             "low_alerted = CASE WHEN ? > ? THEN 0 ELSE low_alerted END "
             "WHERE id = ?",
-            (free_after, covered, free_after, free_after, LOW_STOCK, dish_id),
+            (free_after, covered, free_after, free_after, dish.low_stock, dish_id),
         )
         for oversell_id in waiting[:covered]:
             conn.execute(
@@ -137,7 +150,7 @@ def recount(conn: sqlite3.Connection, dish_id: int, actual: int, who: str) -> in
             "in_stop = CASE WHEN ? = 0 THEN 1 ELSE in_stop END, "  # 0 = в стоп
             "low_alerted = CASE WHEN ? > ? THEN 0 ELSE low_alerted END "
             "WHERE id = ?",
-            (actual, actual, actual, LOW_STOCK, dish_id),
+            (actual, actual, actual, dish.low_stock, dish_id),
         )
         conn.execute(
             "INSERT INTO journal (dish_id, action, delta, free_after, who, comment) "
@@ -168,7 +181,7 @@ def sell(conn: sqlite3.Connection, dish_id: int, who: str) -> SaleResult:
     already = conn.execute(
         "SELECT low_alerted FROM dishes WHERE id = ?", (dish_id,)
     ).fetchone()["low_alerted"]
-    low_alert = 0 < free_after <= LOW_STOCK and not already
+    low_alert = 0 < free_after <= dish.low_stock and not already
     ran_out = free_after == 0
     with conn:
         conn.execute(
@@ -176,7 +189,7 @@ def sell(conn: sqlite3.Connection, dish_id: int, who: str) -> SaleResult:
             "low_alerted = CASE WHEN ? <= ? THEN 1 ELSE low_alerted END, "
             "in_stop = CASE WHEN ? = 0 THEN 1 ELSE in_stop END "
             "WHERE id = ?",
-            (free_after, free_after, LOW_STOCK, free_after, dish_id),
+            (free_after, free_after, dish.low_stock, free_after, dish_id),
         )
         conn.execute(
             "INSERT INTO journal (dish_id, action, delta, free_after, who) "
@@ -248,3 +261,100 @@ def take_due_reminders(conn: sqlite3.Connection, now: datetime) -> list[tuple[Di
                 "DELETE FROM reminders WHERE dish_id = ? AND kind = ?", (r["dish_id"], r["kind"])
             )
     return [(get_dish(conn, r["dish_id"]), r["kind"]) for r in rows]
+
+
+# --- Штучные весовые блюда (раздел 7в) ------------------------------------
+# «Свободно» у такого блюда = число свободных кусков. Счётчики в dishes ведут
+# те же функции, что и для порций (replenish, sell, recount), а таблица pieces
+# помнит, какой именно кусок где.
+
+def parse_weights(text: str) -> list[int]:
+    """«550 620 480» → [550, 620, 480]. Можно в килограммах: «0,550» → 550."""
+    tokens = text.replace(";", " ").split()
+    if not tokens:
+        raise StockError("Напишите веса кусков в граммах через пробел, например 550 620 480.")
+    grams = []
+    for t in tokens:
+        t = t.replace(",", ".")
+        try:
+            value = float(t)
+        except ValueError:
+            raise StockError(f"«{t}» не похоже на вес. Пример: 550 620 480.") from None
+        g = round(value * 1000) if "." in t and value < 10 else round(value)
+        if not 0 < g <= MAX_GRAMS:
+            raise StockError(f"Вес {t} вне границ: от 1 до {MAX_GRAMS} г. Проверьте.")
+        grams.append(g)
+    return grams
+
+
+def add_pieces(conn: sqlite3.Connection, dish_id: int, grams: list[int], who: str) -> Dish:
+    """Пополнение весового блюда кусками. Правила те же, что у replenish:
+    сначала закрываются заказы «сверх остатка», эти куски сразу уходят «в работу»."""
+    before = get_dish(conn, dish_id)
+    if before.kind != WEIGHT:
+        raise StockError("Это порционное блюдо: пополняйте количеством порций.")
+    after = replenish(conn, dish_id, len(grams), who)
+    covered = len(grams) - (after.free - before.free)
+    with conn:
+        for i, g in enumerate(grams):
+            conn.execute(
+                "INSERT INTO pieces (dish_id, grams, state) VALUES (?, ?, ?)",
+                (dish_id, g, "in_work" if i < covered else "free"),
+            )
+    return after
+
+
+def free_pieces(conn: sqlite3.Connection, dish_id: int) -> list[tuple[int, int]]:
+    """Свободные куски блюда: [(id куска, граммы)], от лёгкого к тяжёлому."""
+    rows = conn.execute(
+        "SELECT id, grams FROM pieces WHERE dish_id = ? AND state = 'free' ORDER BY grams, id",
+        (dish_id,),
+    ).fetchall()
+    return [(r["id"], r["grams"]) for r in rows]
+
+
+def recent_weights(conn: sqlite3.Connection, dish_id: int, limit: int = 6) -> list[int]:
+    """Последние разные веса этого блюда: для быстрых кнопок при пополнении."""
+    rows = conn.execute(
+        "SELECT grams FROM pieces WHERE dish_id = ? GROUP BY grams ORDER BY MAX(id) DESC LIMIT ?",
+        (dish_id, limit),
+    ).fetchall()
+    return [r["grams"] for r in rows]
+
+
+def _piece(conn: sqlite3.Connection, piece_id: int) -> sqlite3.Row:
+    row = conn.execute("SELECT * FROM pieces WHERE id = ?", (piece_id,)).fetchone()
+    if row is None or row["state"] != "free":
+        raise StockError("Этого куска уже нет среди свободных.")
+    return row
+
+
+def sell_piece(conn: sqlite3.Connection, piece_id: int, who: str) -> SaleResult:
+    """Пробили конкретный кусок: он уходит «в работу», счётчики как у порции."""
+    piece = _piece(conn, piece_id)
+    with conn:
+        conn.execute("UPDATE pieces SET state = 'in_work' WHERE id = ?", (piece_id,))
+    return sell(conn, piece["dish_id"], who)
+
+
+def find_piece(conn: sqlite3.Connection, dish_id: int, grams: int) -> int | None:
+    """Свободный кусок точно такого веса (для чека iiko). Нет — None, спросим су-шефа."""
+    for piece_id, g in free_pieces(conn, dish_id):
+        if g == grams:
+            return piece_id
+    return None
+
+
+def piece_missing(conn: sqlite3.Connection, piece_id: int, who: str) -> Dish:
+    """Пересчёт: куска нет на месте. Это расхождение −1, при 0 блюдо в стоп."""
+    piece = _piece(conn, piece_id)
+    dish = get_dish(conn, piece["dish_id"])
+    with conn:
+        conn.execute("UPDATE pieces SET state = 'lost' WHERE id = ?", (piece_id,))
+    recount(conn, dish.id, dish.free - 1, who)
+    with conn:
+        conn.execute(
+            "UPDATE journal SET comment = ? WHERE id = (SELECT MAX(id) FROM journal)",
+            (f"расхождение: нет куска {piece['grams']} г",),
+        )
+    return get_dish(conn, dish.id)

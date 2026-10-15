@@ -41,7 +41,7 @@ WELCOME_TEXT = f"""Здравствуйте, шеф! 👋
 • {BTN_LIST}: сколько порций свободно и сколько в работе.
 • {BTN_REPLENISH}: приготовили партию, добавьте порции. Блюдо выйдет из стопа.
 • {BTN_RECOUNT}: спрошу факт по каждому блюду и покажу расхождения.
-• {BTN_ADD}: новое порционное блюдо в список.
+• {BTN_ADD}: порционное или штучное весовое, где у каждого куска свой вес.
 
 Сам слежу и пишу:
 • Осталось 3 порции: предупрежу один раз.
@@ -73,18 +73,52 @@ class Dialog(StatesGroup):
     """Где сейчас су-шеф в разговоре с ботом."""
 
     add_name = State()        # ждём название нового блюда
+    add_kind = State()        # ждём тип: порционное или штучное весовое
     replenish_qty = State()   # ждём, сколько порций добавить
     recount_qty = State()     # ждём фактическое число при пересчёте
 
 
-def format_stock(dishes: list[stock.Dish]) -> str:
+def format_stock(dishes: list[stock.Dish], pieces: dict[int, list[int]] | None = None) -> str:
+    """pieces: веса свободных кусков весовых блюд, {id блюда: [граммы]}."""
     if not dishes:
         return "Список пуст. Добавь порционные блюда кнопкой «🍽 Добавить блюдо»."
     lines = ["Остатки (свободно / в работе):"]
     for d in dishes:
         mark = " ⛔ стоп" if d.in_stop else ""
-        lines.append(f"• {d.name}: {d.free} / {d.in_work}{mark}")
+        free = str(d.free)
+        if d.kind == stock.WEIGHT:
+            grams = (pieces or {}).get(d.id, [])
+            free = f"{d.free} шт" + (f" ({', '.join(map(str, grams))} г)" if grams else "")
+        lines.append(f"• {d.name}: {free} / {d.in_work}{mark}")
     return "\n".join(lines)
+
+
+def kind_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Порционное", callback_data=f"kind:{stock.PORTION}"),
+        InlineKeyboardButton(text="Штучное весовое", callback_data=f"kind:{stock.WEIGHT}"),
+    ]])
+
+
+def grams_keyboard(dish_id: int, grams: list[int], prefix: str) -> InlineKeyboardMarkup | None:
+    """Кнопки с весами по 3 в ряд. prefix:блюдо:граммы."""
+    if not grams:
+        return None
+    buttons = [
+        InlineKeyboardButton(text=f"{g} г", callback_data=f"{prefix}:{dish_id}:{g}") for g in grams
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 3] for i in range(0, len(buttons), 3)])
+
+
+def pieces_keyboard(pieces: list[tuple[int, int]], prefix: str, label: str = "") -> InlineKeyboardMarkup:
+    """Кнопка на каждый кусок. prefix:id куска."""
+    buttons = [
+        InlineKeyboardButton(text=f"{label}{g} г", callback_data=f"{prefix}:{pid}") for pid, g in pieces
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=[buttons[i:i + 3] for i in range(0, len(buttons), 3)])
+
+
+WEIGHTS_HINT = "напишите веса кусков в граммах через пробел, например 550 620 480"
 
 
 def dishes_keyboard(dishes: list[stock.Dish], prefix: str) -> InlineKeyboardMarkup:
@@ -180,10 +214,18 @@ def make_router(
         else:  # картинку случайно удалили: памятка всё равно нужна
             await message.answer(WELCOME_TEXT, reply_markup=MAIN_MENU)
 
+    def stock_text() -> str:
+        dishes = stock.list_dishes(conn)
+        pieces = {
+            d.id: [g for _, g in stock.free_pieces(conn, d.id)]
+            for d in dishes if d.kind == stock.WEIGHT
+        }
+        return format_stock(dishes, pieces)
+
     @router.message(F.text == BTN_LIST)
     async def show_stock(message: Message, state: FSMContext) -> None:
         await state.clear()
-        await message.answer(format_stock(stock.list_dishes(conn)))
+        await message.answer(stock_text())
 
     # --- Добавить блюдо -------------------------------------------------
     @router.message(F.text == BTN_ADD)
@@ -193,14 +235,33 @@ def make_router(
 
     @router.message(Dialog.add_name, F.text)
     async def add_name(message: Message, state: FSMContext) -> None:
+        name = message.text.strip()
+        if not name:
+            await message.answer("Название пустое. Напишите, как блюдо называется в меню.")
+            return
+        await state.set_state(Dialog.add_kind)
+        await state.update_data(name=name)
+        await message.answer(
+            f"«{name}»: какое это блюдо?\n"
+            "Порционное: одинаковые порции. Штучное весовое: каждый кусок со своим весом, "
+            "как ребро телёнка.",
+            reply_markup=kind_keyboard(),
+        )
+
+    @router.callback_query(Dialog.add_kind, F.data.startswith("kind:"))
+    async def add_kind(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        data = await state.get_data()
         try:
-            dish = stock.add_dish(conn, message.text)
+            dish = stock.add_dish(conn, data["name"], call.data.split(":")[1])
         except stock.StockError as e:
-            await message.answer(str(e))
+            await state.clear()
+            await call.message.answer(str(e))
             return
         await state.clear()
-        await message.answer(
-            f"Добавил «{dish.name}». Остаток пока 0, пополните кнопкой «{BTN_REPLENISH}»."
+        kind = "штучное весовое" if dish.kind == stock.WEIGHT else "порционное"
+        await call.message.answer(
+            f"Добавил «{dish.name}» ({kind}). Остаток пока 0, пополните кнопкой «{BTN_REPLENISH}»."
         )
 
     # --- Пополнить ------------------------------------------------------
@@ -213,27 +274,59 @@ def make_router(
             return
         await message.answer("Что пополняем?", reply_markup=dishes_keyboard(dishes, "rep"))
 
+    async def ask_replenish(message: Message, state: FSMContext, dish: stock.Dish, question: str) -> None:
+        """Спросить, сколько добавить. Для весового блюда — веса кусков и быстрые кнопки."""
+        await state.set_state(Dialog.replenish_qty)
+        await state.update_data(dish_id=dish.id)
+        if dish.kind == stock.WEIGHT:
+            recent = stock.recent_weights(conn, dish.id)
+            hint = "\nИли нажмите вес, который уже был." if recent else ""
+            await message.answer(
+                f"{dish.name}: {WEIGHTS_HINT}.{hint}",
+                reply_markup=grams_keyboard(dish.id, recent, "w"),
+            )
+        else:
+            await message.answer(f"{dish.name}: {question}")
+
     @router.callback_query(F.data.startswith("rep:"))
     async def replenish_pick(call: CallbackQuery, state: FSMContext) -> None:
         dish = stock.get_dish(conn, int(call.data.split(":")[1]))
-        await state.set_state(Dialog.replenish_qty)
-        await state.update_data(dish_id=dish.id)
-        await call.message.answer(f"{dish.name}: сколько порций добавить?")
+        await ask_replenish(call.message, state, dish, "сколько порций добавить?")
         await call.answer()
+
+    @router.callback_query(F.data.startswith("w:"))
+    async def replenish_weight_button(call: CallbackQuery) -> None:
+        # Быстрая кнопка с весом: один кусок. Диалог не закрываем, можно жать ещё.
+        await call.answer()
+        _, dish_id, grams = call.data.split(":")
+        before = stock.get_dish(conn, int(dish_id))
+        dish = stock.add_pieces(conn, before.id, [int(grams)], who(call.from_user.id))
+        await after_replenish(call.message, before, dish, 1, f" ({grams} г)")
 
     @router.message(Dialog.replenish_qty, F.text)
     async def replenish_qty(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
         try:
-            qty = stock.parse_count(message.text, allow_zero=False)
             before = stock.get_dish(conn, data["dish_id"])
-            dish = stock.replenish(conn, data["dish_id"], qty, who(message.from_user.id))
+            if before.kind == stock.WEIGHT:
+                grams = stock.parse_weights(message.text)
+                dish = stock.add_pieces(conn, before.id, grams, who(message.from_user.id))
+                qty, detail = len(grams), f" ({', '.join(map(str, grams))} г)"
+            else:
+                qty = stock.parse_count(message.text, allow_zero=False)
+                dish = stock.replenish(conn, before.id, qty, who(message.from_user.id))
+                detail = ""
         except stock.StockError as e:
             await message.answer(str(e))
             return
         await state.clear()
+        await after_replenish(message, before, dish, qty, detail)
+
+    async def after_replenish(
+        message: Message, before: stock.Dish, dish: stock.Dish, qty: int, detail: str
+    ) -> None:
         covered = qty - (dish.free - before.free)
-        text = f"Готово: {dish.name} +{qty}, свободно {dish.free}."
+        text = f"Готово: {dish.name} +{qty}{detail}, свободно {dish.free}."
         if covered:
             text += f"\n{covered} из них закрыли заказы, пробитые сверх остатка."
         if before.in_stop and not dish.in_stop:
@@ -252,6 +345,21 @@ def make_router(
             await message.answer("Пересчёт закончен.\n" + "\n".join(report))
             return
         dish = stock.get_dish(conn, queue[0])
+        if dish.kind == stock.WEIGHT:
+            pieces = stock.free_pieces(conn, dish.id)
+            if not pieces:  # проверять нечего
+                await state.update_data(queue=queue[1:])
+                await ask_next(message, state)
+                return
+            keyboard = pieces_keyboard(pieces, "lost", "нет ")
+            keyboard.inline_keyboard.append(
+                [InlineKeyboardButton(text="✅ Остальное на месте", callback_data="rcok")]
+            )
+            await message.answer(
+                f"{dish.name}: нажмите куски, которых нет. Потом «Остальное на месте».",
+                reply_markup=keyboard,
+            )
+            return
         await message.answer(f"{dish.name}: сколько порций по факту? (в боте {dish.free})")
 
     @router.message(F.text == BTN_RECOUNT)
@@ -268,6 +376,9 @@ def make_router(
     async def recount_qty(message: Message, state: FSMContext) -> None:
         data = await state.get_data()
         dish_id = data["queue"][0]
+        if stock.get_dish(conn, dish_id).kind == stock.WEIGHT:
+            await message.answer("Для этого блюда отметьте куски кнопками выше.")
+            return
         try:
             actual = stock.parse_count(message.text, allow_zero=True)
             was_in_stop = stock.get_dish(conn, dish_id).in_stop
@@ -283,6 +394,31 @@ def make_router(
             report.append(f"• {name}: расхождение {diff:+d}")
         await state.update_data(queue=data["queue"][1:], report=report)
         await ask_next(message, state)
+
+    @router.callback_query(Dialog.recount_qty, F.data.startswith("lost:"))
+    async def recount_piece_lost(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        piece_id = int(call.data.split(":")[1])
+        grams = conn.execute("SELECT grams FROM pieces WHERE id = ?", (piece_id,)).fetchone()
+        try:
+            was = stock.get_dish(conn, (await state.get_data())["queue"][0])
+            dish = stock.piece_missing(conn, piece_id, who(call.from_user.id))
+        except stock.StockError as e:
+            await call.message.answer(str(e))
+            return
+        data = await state.get_data()
+        report = data["report"] + [f"• {dish.name}: нет куска {grams['grams']} г"]
+        await state.update_data(report=report)
+        await call.message.answer(f"Отметил: нет куска {grams['grams']} г. Свободно {dish.free}.")
+        if dish.free == 0 and not was.in_stop:
+            await went_to_stop(call.message, dish)
+
+    @router.callback_query(Dialog.recount_qty, F.data == "rcok")
+    async def recount_pieces_done(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        data = await state.get_data()
+        await state.update_data(queue=data["queue"][1:])
+        await ask_next(call.message, state)
 
     # --- Продажа для проверки (раздел 4, пока без iiko) -------------------
     @router.message(F.text == BTN_SALE)
@@ -300,7 +436,24 @@ def make_router(
     @router.callback_query(F.data.startswith("sale:"))
     async def sale_pick(call: CallbackQuery) -> None:
         await call.answer()
-        result = stock.sell(conn, int(call.data.split(":")[1]), who(call.from_user.id))
+        dish = stock.get_dish(conn, int(call.data.split(":")[1]))
+        pieces = stock.free_pieces(conn, dish.id) if dish.kind == stock.WEIGHT else []
+        if pieces:  # весовое: какой кусок пробили (в чеке будет вес)
+            await call.message.answer(
+                f"{dish.name}: какой кусок пробили?", reply_markup=pieces_keyboard(pieces, "sp")
+            )
+            return
+        result = stock.sell(conn, dish.id, who(call.from_user.id))
+        await report_sale(call.message, result)
+
+    @router.callback_query(F.data.startswith("sp:"))
+    async def sale_piece(call: CallbackQuery) -> None:
+        await call.answer()
+        try:
+            result = stock.sell_piece(conn, int(call.data.split(":")[1]), who(call.from_user.id))
+        except stock.StockError as e:
+            await call.message.answer(str(e))
+            return
         await report_sale(call.message, result)
 
     async def report_sale(message: Message, result: stock.SaleResult) -> None:
@@ -316,7 +469,11 @@ def make_router(
             return
         await message.answer(f"Пробито: {dish.name}, свободно {dish.free}.")
         if result.low_alert:
-            await message.answer(f"⚠️ Шеф, {dish.name}: осталось {dish.free} порции.")
+            if dish.kind == stock.WEIGHT:
+                left = ", ".join(f"{g} г" for _, g in stock.free_pieces(conn, dish.id))
+                await message.answer(f"⚠️ Шеф, {dish.name}: остался {dish.free} кусок ({left}).")
+            else:
+                await message.answer(f"⚠️ Шеф, {dish.name}: осталось {dish.free} порции.")
         if result.ran_out:
             await went_to_stop(message, dish)
 
@@ -343,9 +500,7 @@ def make_router(
         dish = stock.get_dish(conn, int(dish_id))
         stock.clear_reminder(conn, dish.id, "ready")
         if yes == "1":
-            await state.set_state(Dialog.replenish_qty)
-            await state.update_data(dish_id=dish.id)
-            await call.message.answer(f"{dish.name}: сколько порций готово?")
+            await ask_replenish(call.message, state, dish, "сколько порций готово?")
         else:
             await call.message.answer(
                 f"{dish.name}: через сколько будет?", reply_markup=eta_keyboard(dish.id)
