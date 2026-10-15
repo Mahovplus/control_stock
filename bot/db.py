@@ -5,7 +5,8 @@
 - journal: каждое движение порции, чтобы всегда можно было понять, откуда цифра;
 - oversells: пробили сверх остатка, ждём решения су-шефа (раздел 5);
 - timers: когда спросить су-шефа «готово?» (раздел 6);
-- reminders: одно напоминание су-шефу, если он не ответил (раздел 6).
+- reminders: одно напоминание су-шефу, если он не ответил (раздел 6);
+- pieces: куски штучных весовых блюд, у каждого свой вес (раздел 7в).
 """
 
 import sqlite3
@@ -21,7 +22,8 @@ CREATE TABLE IF NOT EXISTS dishes (
     sold        INTEGER NOT NULL DEFAULT 0,
     written_off INTEGER NOT NULL DEFAULT 0,
     in_stop     INTEGER NOT NULL DEFAULT 0,     -- 1 = блюдо в стоп-листе
-    low_alerted INTEGER NOT NULL DEFAULT 0      -- 1 = «осталось 3» уже отправили
+    low_alerted INTEGER NOT NULL DEFAULT 0,     -- 1 = «осталось 3» уже отправили
+    kind        TEXT NOT NULL DEFAULT 'portion' -- portion = порционное, weight = штучное весовое
 );
 
 CREATE TABLE IF NOT EXISTS journal (
@@ -53,12 +55,23 @@ CREATE TABLE IF NOT EXISTS reminders (
     due_at  TEXT NOT NULL,
     PRIMARY KEY (dish_id, kind)
 );
+
+CREATE TABLE IF NOT EXISTS pieces (
+    id       INTEGER PRIMARY KEY AUTOINCREMENT,
+    dish_id  INTEGER NOT NULL REFERENCES dishes(id),
+    grams    INTEGER NOT NULL CHECK (grams > 0),
+    state    TEXT NOT NULL DEFAULT 'free',  -- free, in_work, sold, written_off, lost
+    added_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
 """
 
 # Колонки, добавленные после шага 1. У тех, у кого база уже создана,
 # CREATE TABLE IF NOT EXISTS их не добавит, поэтому добавляем отдельно.
 NEW_COLUMNS = {
-    "dishes": [("low_alerted", "INTEGER NOT NULL DEFAULT 0")],
+    "dishes": [
+        ("low_alerted", "INTEGER NOT NULL DEFAULT 0"),
+        ("kind", "TEXT NOT NULL DEFAULT 'portion'"),
+    ],
 }
 
 

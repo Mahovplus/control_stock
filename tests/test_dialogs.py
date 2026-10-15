@@ -102,7 +102,8 @@ def test_full_flow_add_replenish_recount():
     assert "Здравствуйте, шеф" in h.say("/start")[0]
 
     h.say(BTN_ADD)
-    assert "Добавил «Вителло тоннато»" in h.say("Вителло тоннато")[0]
+    assert "какое это блюдо" in h.say("Вителло тоннато")[0]
+    assert "Добавил «Вителло тоннато» (порционное)" in h.press("kind:portion")[0]
     dish = stock.list_dishes(h.conn)[0]
 
     assert "Что пополняем?" in h.say(BTN_REPLENISH)[0]
@@ -135,6 +136,7 @@ def test_bot_ignores_everyone_except_sous_chef():
 def _dish_with(h, qty):
     h.say(BTN_ADD)
     h.say("Вителло тоннато")
+    h.press("kind:portion")
     dish = stock.list_dishes(h.conn)[0]
     h.press(f"rep:{dish.id}")
     h.say(str(qty))
@@ -245,3 +247,50 @@ def test_no_reminder_after_answer_or_replenish():
     h.press(f"rep:{dish.id}")
     h.say("3")  # пополнил раньше таймера: ни «готово?», ни напоминаний
     assert h.tick(datetime.now() + timedelta(hours=5)) == []
+
+
+def _rib(h, weights="550 620 480"):
+    h.say(BTN_ADD)
+    h.say("Ребро телёнка")
+    assert "штучное весовое" in h.press("kind:weight")[0]
+    dish = stock.list_dishes(h.conn)[0]
+    assert "веса кусков в граммах" in h.press(f"rep:{dish.id}")[0]
+    out = h.say(weights)
+    return dish, out
+
+
+def test_weight_dish_replenish_list_and_quick_button():
+    """Раздел 7в: веса одним сообщением, остатки с весами, быстрая кнопка."""
+    h = Harness()
+    dish, out = _rib(h)
+    assert "+3 (550, 620, 480 г), свободно 3" in out[0]
+    assert "Ребро телёнка: 3 шт (480, 550, 620 г) / 0" in h.say("📋 Остатки")[0]
+
+    h.press(f"rep:{dish.id}")  # недавние веса уже есть кнопками
+    assert "+1 (550 г), свободно 4" in h.press(f"w:{dish.id}:550")[0]
+
+
+def test_weight_dish_sale_by_piece_low_and_stop():
+    h = Harness()
+    dish, _ = _rib(h, "550 620")
+    assert "какой кусок пробили" in h.press(f"sale:{dish.id}")[0]
+    piece_550 = stock.find_piece(h.conn, dish.id, 550)
+    out = h.press(f"sp:{piece_550}")
+    assert "свободно 1" in out[0] and "остался 1 кусок (620 г)" in out[1]
+
+    out = h.press(f"sp:{stock.find_piece(h.conn, dish.id, 620)}")
+    assert any("ставлю в стоп" in t for t in out)
+    assert h.to_waiters()[-1] == "⛔ Ребро телёнка в стопе. Когда вернётся, сообщу."
+    assert "Этого куска уже нет" in h.press(f"sp:{piece_550}")[0]  # дважды не продать
+
+
+def test_weight_dish_recount_marks_missing_piece():
+    h = Harness()
+    dish, _ = _rib(h, "550 620")
+    out = h.say(BTN_RECOUNT)
+    assert "нажмите куски, которых нет" in out[0]
+    lost = stock.find_piece(h.conn, dish.id, 620)
+    assert "нет куска 620 г. Свободно 1" in h.press(f"lost:{lost}")[0]
+    out = h.press("rcok")
+    assert "Пересчёт закончен" in out[0] and "нет куска 620 г" in out[0]
+    assert [g for _, g in stock.free_pieces(h.conn, dish.id)] == [550]
