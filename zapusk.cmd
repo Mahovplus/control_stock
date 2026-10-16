@@ -23,13 +23,23 @@ if errorlevel 1 goto pip_failed
 
 echo.
 echo Запускаю бота. Когда появится "Start polling", напишите боту /start в Telegram.
-echo Остановить бота: Ctrl+C или закрыть это окно.
+echo Остановить бота: закройте это окно.
+echo Ошибки пишутся ещё и в файл data\bot.log
 echo.
+:run
 %PY% -m bot.main
+rem Код 2 = ошибка в .env: перезапуск не поможет, нужно исправить файл
+if errorlevel 2 if not errorlevel 3 goto config_error
 echo.
-echo Бот остановлен.
+echo Бот остановился. Перезапускаю через 10 секунд. Чтобы не перезапускать, закройте окно.
+timeout /t 10 /nobreak >nul
+goto run
+
+:config_error
+echo.
+echo Исправьте файл .env по подсказке выше и запустите zapusk.cmd снова.
 pause
-exit /b 0
+exit /b 1
 
 :no_env
 echo ОШИБКА: в этой папке нет файла .env

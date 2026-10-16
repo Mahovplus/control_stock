@@ -15,6 +15,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
+    ErrorEvent,
     FSInputFile,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
@@ -256,6 +257,23 @@ def make_router(
     async def chat_id(message: Message) -> None:
         # Напишите /chatid в группе официантов, чтобы узнать число для .env
         await message.answer(f"ID этого чата: {message.chat.id}")
+
+    @router.errors()
+    async def on_error(event: ErrorEvent, bot: Bot) -> None:
+        """Любая поломка в кнопке: записать в лог и сказать су-шефу, а не молчать."""
+        logging.error("Ошибка в обработчике", exc_info=event.exception)
+        source = event.update.message or event.update.callback_query
+        if source is None or source.from_user is None:
+            return
+        try:
+            await bot.send_message(
+                source.from_user.id,
+                "⚠️ Что-то пошло не так, действие могло не записаться. Проверьте «📋 Остатки» "
+                f"и повторите. Если повторится, пришлите Даниилу время и что нажали.\n"
+                f"Ошибка: {type(event.exception).__name__}",
+            )
+        except TelegramAPIError:
+            logging.exception("Не смог сообщить об ошибке")
 
     @router.message(Command("testchat"))
     async def test_chat(message: Message) -> None:

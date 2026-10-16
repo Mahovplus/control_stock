@@ -362,3 +362,10 @@ def test_testchat_reports_missing_or_sent():
     out = h.say("/testchat")
     assert h.to_waiters() == ["✅ Проверка связи: бот остатков пишет в этот чат."]
     assert "Отправил пробное сообщение" in out[-1]
+
+
+def test_broken_button_tells_chef_instead_of_silence():
+    h = Harness()
+    out = h.press("rep:999")  # такого блюда нет: обработчик падает
+    assert "Что-то пошло не так" in out[-1] and "StockError" in out[-1]
+    assert h.say(BTN_LIST)  # бот жив и отвечает дальше
