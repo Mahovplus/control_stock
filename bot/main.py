@@ -12,10 +12,12 @@ from pathlib import Path
 
 from aiogram import Bot, Dispatcher
 
+from bot import stock
 from bot.backup import backup_dir_for
 from bot.config import load_config
 from bot.db import connect
-from bot.handlers import make_router
+from bot.handlers import link_with_iiko, make_router
+from bot.iiko import IikoClient, IikoError
 from bot.timers import timer_loop
 
 
@@ -31,6 +33,21 @@ def setup_logging(db_path: str) -> None:
     )
 
 
+async def link_old_dishes(conn, iiko: IikoClient) -> None:
+    """При запуске связываем с меню iiko блюда, добавленные раньше. Ошибка iiko не мешает боту."""
+    dishes = stock.unlinked_dishes(conn)
+    if not dishes:
+        return
+    try:
+        missing = await link_with_iiko(conn, iiko, dishes)
+    except IikoError as e:
+        logging.warning("iiko: не связал блюда при запуске: %s", e)
+        return
+    logging.info("iiko: связал %d блюд", len(dishes) - len(missing))
+    if missing:
+        logging.warning("iiko: нет в меню iiko: %s", ", ".join(missing))
+
+
 async def main() -> None:
     try:
         config = load_config()
@@ -41,7 +58,12 @@ async def main() -> None:
     conn = connect(config.db_path)
     bot = Bot(config.bot_token)
     dp = Dispatcher()  # по умолчанию хранит состояние диалогов в памяти
-    dp.include_router(make_router(conn, config.sous_chef_ids, config.waiters_chat_id))
+    iiko = IikoClient(**config.iiko) if config.iiko else None
+    if iiko:
+        await link_old_dishes(conn, iiko)
+    else:
+        logging.info("iiko не подключена: ключей IIKO_ нет в .env, стоп в iiko вручную")
+    dp.include_router(make_router(conn, config.sous_chef_ids, config.waiters_chat_id, iiko))
     timers = asyncio.create_task(  # фоном
         timer_loop(bot, conn, config.sous_chef_ids, backup_dir_for(config.db_path))
     )

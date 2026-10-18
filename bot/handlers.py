@@ -25,6 +25,7 @@ from aiogram.types import (
 )
 
 from bot import stock
+from bot.iiko import IikoClient, IikoError, find_dish
 
 BTN_LIST = "📋 Остатки"
 BTN_REPLENISH = "➕ Пополнить"
@@ -67,7 +68,7 @@ def welcome_text(low: int = stock.LOW_STOCK, minutes: int = stock.REMIND_MINUTES
 Важно:
 • Отвечаю только су-шефам из списка.
 • Остаток не уходит ниже 0, решение всегда за вами.
-• Пока iiko не подключена, стоп в iiko ставьте вручную, а продажи для проверки вводите кнопкой «{BTN_SALE}».
+• Стоп в iiko ставлю и снимаю сам, если подключены ключи iiko. Продажи пока вводите кнопкой «{BTN_SALE}».
 
 Памятка всегда по команде /help."""
 
@@ -168,12 +169,25 @@ def ready_keyboard(dish_id: int) -> InlineKeyboardMarkup:
     ]])
 
 
-def stop_text(name: str) -> str:
-    return (
-        f"⛔ Шеф, {name} закончилось, ставлю в стоп.\n"
-        "Поставьте в стоп и в iiko вручную: iiko пока не подключена.\n"
-        "Через сколько будет?"
-    )
+def stop_text(name: str, iiko_note: str) -> str:
+    return f"⛔ Шеф, {name} закончилось, ставлю в стоп.\n{iiko_note}\nЧерез сколько будет?"
+
+
+async def link_with_iiko(conn: sqlite3.Connection, iiko: IikoClient, dishes: list[stock.Dish]) -> list[str]:
+    """Связывает блюда с меню iiko по точному названию (раздел 8). Возвращает названия,
+    которые не нашлись: для них стоп в iiko придётся ставить вручную."""
+    menu = await iiko.dishes()
+    missing = []
+    for dish in dishes:
+        found = find_dish(menu, dish.name)
+        if found is None:
+            missing.append(dish.name)
+            continue
+        try:
+            stock.set_iiko_id(conn, dish.id, found.id)
+        except sqlite3.IntegrityError:  # это блюдо iiko уже связано с другим блюдом бота
+            missing.append(dish.name)
+    return missing
 
 
 def as_ids(sous_chef_ids: int | list[int]) -> list[int]:
@@ -230,7 +244,10 @@ SETTING_NAMES = {
 
 
 def make_router(
-    conn: sqlite3.Connection, sous_chef_ids: int | list[int], waiters_chat_id: int | None = None
+    conn: sqlite3.Connection,
+    sous_chef_ids: int | list[int],
+    waiters_chat_id: int | None = None,
+    iiko: IikoClient | None = None,
 ) -> Router:
     router = Router()
     chefs = as_ids(sous_chef_ids)
@@ -244,12 +261,28 @@ def make_router(
     async def to_waiters(bot: Bot, text: str) -> None:
         await notify_waiters(bot, waiters_chat_id, chefs, text)
 
+    async def iiko_stop(dish: stock.Dish, on: bool) -> str:
+        """Ставит (on) или снимает стоп в iiko. Возвращает строку для су-шефа."""
+        action = "Поставьте в стоп" if on else "Снимите стоп"
+        iiko_id = stock.get_iiko_id(conn, dish.id)
+        if iiko is None:
+            return f"{action} и в iiko вручную: iiko не подключена."
+        if iiko_id is None:
+            return f"{action} в iiko вручную: не нашёл «{dish.name}» в меню iiko."
+        try:
+            await (iiko.stop(iiko_id) if on else iiko.unstop(iiko_id))
+        except IikoError as e:
+            logging.warning("iiko: %s «%s»: %s", "стоп" if on else "снять стоп", dish.name, e)
+            return f"Не получилось в iiko ({e}). {action} вручную."
+        return "В iiko поставил в стоп." if on else "В iiko стоп снял."
+
     async def went_to_stop(message: Message, dish: stock.Dish) -> None:
-        """Раздел 6: официанты узнают сразу, су-шефам одно сообщение с кнопками.
-        Пишем всем су-шефам: время выберет тот, кто свободен."""
+        """Раздел 6: официанты узнают сразу, потом стоп в iiko, су-шефам одно сообщение
+        с кнопками. Пишем всем су-шефам: время выберет тот, кто свободен."""
         await to_waiters(message.bot, f"⛔ {dish.name} в стопе. Когда вернётся, сообщу.")
+        note = await iiko_stop(dish, on=True)
         await send_to_chefs(
-            message.bot, chefs, stop_text(dish.name), reply_markup=eta_keyboard(dish.id)
+            message.bot, chefs, stop_text(dish.name, note), reply_markup=eta_keyboard(dish.id)
         )
         stock.set_reminder(conn, dish.id, "eta", datetime.now())
 
@@ -358,7 +391,23 @@ def make_router(
         kind = "штучное весовое" if dish.kind == stock.WEIGHT else "порционное"
         await call.message.answer(
             f"Добавил «{dish.name}» ({kind}). Остаток пока 0, пополните кнопкой «{BTN_REPLENISH}»."
+            + await iiko_link_note(dish)
         )
+
+    async def iiko_link_note(dish: stock.Dish) -> str:
+        """Связать новое блюдо с меню iiko и сказать су-шефу, получилось ли."""
+        if iiko is None:
+            return ""
+        try:
+            missing = await link_with_iiko(conn, iiko, [dish])
+        except IikoError as e:
+            return f"\nС iiko не связал ({e}). Стоп в iiko пока вручную."
+        if missing:
+            return (
+                "\nВ меню iiko не нашёл блюдо с таким же названием. "
+                "Стоп в iiko для него ставьте вручную или переименуйте точно как в iiko."
+            )
+        return "\nСвязал с меню iiko: стоп там буду ставить сам."
 
     # --- Пополнить ------------------------------------------------------
     @router.message(F.text == BTN_REPLENISH)
@@ -426,7 +475,7 @@ def make_router(
         if covered:
             text += f"\n{covered} из них закрыли заказы, пробитые сверх остатка."
         if before.in_stop and not dish.in_stop:
-            text += "\nБлюдо вышло из стопа. Снимите стоп и в iiko вручную."
+            text += "\nБлюдо вышло из стопа. " + await iiko_stop(dish, on=False)
         await message.answer(text)
         if before.in_stop and not dish.in_stop:
             await to_waiters(message.bot, f"✅ {dish.name} снова в продаже.")
@@ -683,7 +732,8 @@ def make_router(
             await message.answer(str(e))  # диалог не сбрасываем: можно написать другое
             return
         await state.clear()
-        await message.answer(f"Готово: «{old.name}» теперь «{dish.name}».")
+        note = "" if stock.get_iiko_id(conn, dish.id) else await iiko_link_note(dish)
+        await message.answer(f"Готово: «{old.name}» теперь «{dish.name}».{note}")
 
     @router.callback_query(F.data.startswith("del:"))
     async def delete_ask(call: CallbackQuery) -> None:

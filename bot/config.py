@@ -7,6 +7,8 @@ import os
 from dataclasses import dataclass
 
 MAX_CHEFS = 4
+# Ключи iiko Cloud API: либо все три, либо ни одного
+IIKO_KEYS = ("IIKO_API_KEY", "IIKO_APP_ID", "IIKO_CLIENT_SECRET")
 
 
 @dataclass
@@ -15,6 +17,7 @@ class Config:
     sous_chef_ids: list[int]  # 1–4 су-шефа (раздел 14)
     db_path: str
     waiters_chat_id: int | None = None  # чат официантов; пусто = не настроен
+    iiko: dict | None = None  # ключи Cloud API; пусто = стоп в iiko вручную
 
 
 def load_env_file(path: str = ".env") -> None:
@@ -51,6 +54,10 @@ def load_config() -> Config:
         problems.append(
             f"WAITERS_CHAT_ID должен быть числом (у групп с минусом), сейчас там: «{waiters}»"
         )
+    iiko_keys = {k: os.environ.get(k, "").strip() for k in IIKO_KEYS}
+    if any(iiko_keys.values()) and not all(iiko_keys.values()):
+        missing = ", ".join(k for k, v in iiko_keys.items() if not v)
+        problems.append(f"Для iiko не хватает: {missing} (или удалите все ключи IIKO_, тогда без iiko)")
     if problems and not os.path.exists(".env"):
         problems.insert(0, f"Нет файла .env в папке {os.getcwd()} (образец: .env.example)")
     if problems:
@@ -60,4 +67,16 @@ def load_config() -> Config:
         [int(c) for c in dict.fromkeys(chefs)],  # повтор одного ID не считаем
         os.environ.get("DB_PATH", "data/ostatki.db"),
         int(waiters) if waiters else None,
+        _iiko_settings(iiko_keys) if all(iiko_keys.values()) else None,
     )
+
+
+def _iiko_settings(keys: dict) -> dict:
+    """Аргументы для IikoClient. Организацию и группу касс можно не указывать."""
+    return {
+        "api_key": keys["IIKO_API_KEY"],
+        "app_id": keys["IIKO_APP_ID"],
+        "client_secret": keys["IIKO_CLIENT_SECRET"],
+        "organization_id": os.environ.get("IIKO_ORG_ID", "").strip() or None,
+        "terminal_group_id": os.environ.get("IIKO_TERMINAL_GROUP_ID", "").strip() or None,
+    }
