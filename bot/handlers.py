@@ -25,14 +25,15 @@ from aiogram.types import (
 )
 
 from bot import stock
-from bot.iiko import IikoClient, IikoError, find_dish
+from bot.iiko import CashOrder, IikoClient, IikoError, find_dish
 
 BTN_LIST = "📋 Остатки"
 BTN_REPLENISH = "➕ Пополнить"
 BTN_RECOUNT = "🔄 Утренний пересчёт"
 BTN_ADD = "🍽 Добавить блюдо"
-BTN_SALE = "🧾 Продажа (тест)"  # пока iiko не подключена, продажу вводим руками
+BTN_SALE = "🧾 Продажа (тест)"  # проверка без кассы: продажу вводим руками
 BTN_SETTINGS = "⚙️ Настройки"
+MENU_BUTTONS = {BTN_LIST, BTN_REPLENISH, BTN_RECOUNT, BTN_ADD, BTN_SALE, BTN_SETTINGS}
 
 WELCOME_PICTURE = Path(__file__).resolve().parent.parent / "assets" / "welcome.png"
 
@@ -95,6 +96,7 @@ class Dialog(StatesGroup):
     replenish_qty = State()   # ждём, сколько порций добавить
     recount_qty = State()     # ждём фактическое число при пересчёте
     rename_name = State()     # ждём новое название блюда
+    write_off_comment = State()  # ждём, почему списали отказ гостя
 
 
 def format_stock(dishes: list[stock.Dish], pieces: dict[int, list[int]] | None = None) -> str:
@@ -166,6 +168,13 @@ def ready_keyboard(dish_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[
         InlineKeyboardButton(text="Да", callback_data=f"ready:{dish_id}:1"),
         InlineKeyboardButton(text="Нет", callback_data=f"ready:{dish_id}:0"),
+    ]])
+
+
+def refusal_keyboard(position_id: str) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="Вернуть в остаток", callback_data=f"rfb:{position_id}"),
+        InlineKeyboardButton(text="Списать", callback_data=f"rfw:{position_id}"),
     ]])
 
 
@@ -276,13 +285,13 @@ def make_router(
             return f"Не получилось в iiko ({e}). {action} вручную."
         return "В iiko поставил в стоп." if on else "В iiko стоп снял."
 
-    async def went_to_stop(message: Message, dish: stock.Dish) -> None:
+    async def went_to_stop(bot: Bot, dish: stock.Dish) -> None:
         """Раздел 6: официанты узнают сразу, потом стоп в iiko, су-шефам одно сообщение
         с кнопками. Пишем всем су-шефам: время выберет тот, кто свободен."""
-        await to_waiters(message.bot, f"⛔ {dish.name} в стопе. Когда вернётся, сообщу.")
+        await to_waiters(bot, f"⛔ {dish.name} в стопе. Когда вернётся, сообщу.")
         note = await iiko_stop(dish, on=True)
         await send_to_chefs(
-            message.bot, chefs, stop_text(dish.name, note), reply_markup=eta_keyboard(dish.id)
+            bot, chefs, stop_text(dish.name, note), reply_markup=eta_keyboard(dish.id)
         )
         stock.set_reminder(conn, dish.id, "eta", datetime.now())
 
@@ -532,7 +541,7 @@ def make_router(
             await message.answer(str(e))
             return
         if actual == 0 and not was_in_stop:  # раздел 5: стало 0, значит стоп
-            await went_to_stop(message, stock.get_dish(conn, dish_id))
+            await went_to_stop(message.bot, stock.get_dish(conn, dish_id))
         report = data["report"]
         if diff:
             name = stock.get_dish(conn, dish_id).name
@@ -556,7 +565,7 @@ def make_router(
         await state.update_data(report=report)
         await call.message.answer(f"Отметил: нет куска {grams['grams']} г. Свободно {dish.free}.")
         if dish.free == 0 and not was.in_stop:
-            await went_to_stop(call.message, dish)
+            await went_to_stop(call.bot, dish)
 
     @router.callback_query(Dialog.recount_qty, F.data == "rcok")
     async def recount_pieces_done(call: CallbackQuery, state: FSMContext) -> None:
@@ -589,7 +598,7 @@ def make_router(
             )
             return
         result = stock.sell(conn, dish.id, who(call.from_user.id))
-        await report_sale(call.message, result)
+        await report_sale(call.bot, result, call.message)
 
     @router.callback_query(F.data.startswith("sp:"))
     async def sale_piece(call: CallbackQuery) -> None:
@@ -599,34 +608,110 @@ def make_router(
         except stock.StockError as e:
             await call.message.answer(str(e))
             return
-        await report_sale(call.message, result)
+        await report_sale(call.bot, result, call.message)
 
-    async def report_sale(message: Message, result: stock.SaleResult) -> None:
-        """Уведомления раздела 5 после одной продажи."""
+    async def report_sale(bot: Bot, result: stock.SaleResult, message: Message | None = None) -> None:
+        """Уведомления раздела 5 после одной продажи. message — тест кнопкой: ответить, что пробито.
+        Продажи с кассы бот не подтверждает, иначе су-шефу пришло бы сообщение на каждую порцию."""
         dish = result.dish
         if result.oversold:
             await send_to_chefs(
-                message.bot,
+                bot,
                 chefs,
                 f"🚨 Шеф, {dish.name} пробили, а порций нет. Остаток остаётся 0.\n"
                 "Решите, что делать. Если сделаете порцию, добавьте её кнопкой "
                 f"«{BTN_REPLENISH}»: она закроет этот заказ.",
             )
-            await to_waiters(message.bot, f"🚨 {dish.name} пробили, а порций нет. Подойдите к су-шефу.")
+            await to_waiters(bot, f"🚨 {dish.name} пробили, а порций нет. Подойдите к су-шефу.")
             return
-        await message.answer(f"Пробито: {dish.name}, свободно {dish.free}.")
+        if message is not None:
+            await message.answer(f"Пробито: {dish.name}, свободно {dish.free}.")
         if result.low_alert:
             if dish.kind == stock.WEIGHT:
                 left = ", ".join(f"{g} г" for _, g in stock.free_pieces(conn, dish.id))
                 await send_to_chefs(
-                    message.bot, chefs, f"⚠️ Шеф, {dish.name}: остался {dish.free} кусок ({left})."
+                    bot, chefs, f"⚠️ Шеф, {dish.name}: остался {dish.free} кусок ({left})."
                 )
             else:
                 await send_to_chefs(
-                    message.bot, chefs, f"⚠️ Шеф, {dish.name}: осталось {dish.free} {portions_word(dish.free)}."
+                    bot, chefs, f"⚠️ Шеф, {dish.name}: осталось {dish.free} {portions_word(dish.free)}."
                 )
         if result.ran_out:
-            await went_to_stop(message, dish)
+            await went_to_stop(bot, dish)
+
+    # --- Продажи с кассы iiko (раздел 4) -----------------------------------
+    async def apply_cash(bot: Bot, orders: list[CashOrder], since: datetime) -> None:
+        """Заказы с кассы → карманы блюд. Каждую позицию считаем один раз (cash_positions).
+
+        Отправили на кухню → как продажа; чек оплачен → продано; удалили после кухни →
+        вопрос су-шефу. Позиции, отправленные до since, и блюда не на контроле пропускаем.
+        """
+        for order in orders:
+            for item in order.items:
+                dish = stock.dish_by_iiko_id(conn, item.product_id)
+                if dish is None or dish.kind == stock.WEIGHT:
+                    continue  # весовые пока только кнопкой: из чека не понять, какой кусок
+                deleted = item.deleted or order.status == "Deleted"
+                pos = stock.cash_position(conn, item.position_id)
+                if pos is None:
+                    if deleted or item.printed is None or item.printed < since:
+                        continue  # удалили до кухни, ещё не отправили или было до бота
+                    if item.amount != int(item.amount) or item.amount < 1:
+                        logging.warning("iiko: %s ×%s, не целое число порций", dish.name, item.amount)
+                        continue
+                    sales = stock.cash_sale(
+                        conn, item.position_id, order.id, dish.id, int(item.amount)
+                    )
+                    for result in sales:
+                        await report_sale(bot, result)
+                if deleted:
+                    if stock.cash_refused(conn, item.position_id, item.note or "без комментария"):
+                        await ask_refusal(bot, item.position_id)
+                elif order.status == "Closed":
+                    stock.cash_paid(conn, item.position_id)
+
+    async def ask_refusal(bot: Bot, position_id: str) -> None:
+        pos = stock.cash_position(conn, position_id)
+        dish = stock.get_dish(conn, pos.dish_id)
+        await send_to_chefs(
+            bot, chefs,
+            f"↩️ Шеф, {dish.name} ×{pos.counted} удалили из заказа после кухни.\n"
+            f"В iiko: {pos.note}.\nЧто делаем с порцией?",
+            reply_markup=refusal_keyboard(position_id),
+        )
+
+    router.apply_cash = apply_cash  # зовёт опрос кассы (cash.py)
+
+    @router.callback_query(F.data.startswith("rfb:"))
+    async def refusal_back(call: CallbackQuery) -> None:
+        await call.answer()
+        try:
+            before, dish, n = stock.refusal_return(
+                conn, call.data.split(":", 1)[1], who(call.from_user.id)
+            )
+        except stock.StockError as e:
+            await call.message.answer(str(e))
+            return
+        await after_replenish(call.message, before, dish, n, " (вернули после отказа)")
+
+    @router.callback_query(F.data.startswith("rfw:"))
+    async def refusal_write_off(call: CallbackQuery, state: FSMContext) -> None:
+        await call.answer()
+        try:
+            dish = stock.refusal_write_off(conn, call.data.split(":", 1)[1], who(call.from_user.id))
+        except stock.StockError as e:
+            await call.message.answer(str(e))
+            return
+        await state.set_state(Dialog.write_off_comment)
+        await state.update_data(dish_id=dish.id)
+        await call.message.answer(f"Списал: {dish.name}. Напишите одним сообщением, почему.")
+
+    @router.message(Dialog.write_off_comment, F.text, ~F.text.in_(MENU_BUTTONS))
+    async def write_off_comment(message: Message, state: FSMContext) -> None:
+        data = await state.get_data()
+        await state.clear()
+        stock.add_write_off_comment(conn, data["dish_id"], message.text)
+        await message.answer("Записал причину списания.")
 
     # --- Возврат в продажу (раздел 6) -------------------------------------
     @router.callback_query(F.data.startswith("eta:"))

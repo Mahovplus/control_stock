@@ -1,7 +1,7 @@
 """Связь с iiko через Cloud API (раздел 8 logika-bota.md).
 
-Бот здесь только ставит и снимает стоп и берёт список блюд, чтобы связать
-свои блюда с меню iiko. Всё проверено на демо-стенде 18.10.2026
+Бот здесь ставит и снимает стоп, берёт список блюд, чтобы связать свои блюда
+с меню iiko, и читает заказы с кассы (раздел 4). Всё проверено на демо-стенде 18.10.2026
 (заметки: bot-ostatkov/iiko-stend.md).
 
 Ключи берутся из .env (IIKO_API_KEY, IIKO_APP_ID, IIKO_CLIENT_SECRET). Если их нет,
@@ -12,6 +12,7 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass
+from datetime import datetime, timedelta
 
 import aiohttp
 
@@ -30,6 +31,51 @@ class IikoDish:
     id: str
     name: str
     code: str  # артикул в iiko, например 00005
+
+
+@dataclass
+class CashItem:
+    """Позиция заказа с кассы."""
+    position_id: str
+    product_id: str
+    amount: float
+    printed: datetime | None  # когда отправили на кухню; None — ещё не отправили
+    deleted: bool
+    note: str  # тип удаления и комментарий официанта, если удалили
+
+
+@dataclass
+class CashOrder:
+    id: str
+    status: str  # New, Bill, Closed, Deleted
+    items: list[CashItem]
+
+
+def _iiko_time(value: str | None) -> datetime | None:
+    """«2026-10-18 09:15:35.864» → datetime. Время кассы, как на компьютере с iikoFront."""
+    return datetime.strptime(value[:19], "%Y-%m-%d %H:%M:%S") if value else None
+
+
+def _cash_order(raw: dict) -> CashOrder | None:
+    order = raw.get("order")
+    if not order:  # заказ ещё создаётся или с ошибкой
+        return None
+    items = []
+    for i in order.get("items") or []:
+        product = i.get("product") or {}
+        if i.get("type") != "Product" or not i.get("positionId") or not product.get("id"):
+            continue  # услуги, комбо и прочее бот не считает
+        deleted = i.get("deleted")
+        note = ""
+        if deleted:
+            method = deleted.get("deletionMethod") or {}
+            removal = (method.get("removalType") or {}).get("name") or ""
+            note = ", ".join(x for x in (removal, method.get("comment") or "") if x)
+        items.append(CashItem(
+            i["positionId"], product["id"], float(i.get("amount") or 0),
+            _iiko_time(i.get("whenPrinted")), bool(deleted), note,
+        ))
+    return CashOrder(raw["id"], order.get("status") or "", items)
 
 
 def same_name(a: str, b: str) -> bool:
@@ -53,6 +99,7 @@ class IikoClient:
         self._login = {"apiKey": api_key, "appId": app_id, "clientSecret": client_secret}
         self.organization_id = organization_id
         self.terminal_group_id = terminal_group_id
+        self._tables: list[str] | None = None
         self._token: str | None = None
         self._token_at = 0.0
 
@@ -144,3 +191,51 @@ class IikoClient:
                 raise IikoError(f"касса не выполнила команду: {status.get('exception') or status}")
         logging.warning("iiko: команда %s без ответа кассы", data["correlationId"])
         raise IikoError("касса не ответила. Возможно, iikoFront выключен")
+
+    async def _tables_ids(self, org: str, group: str) -> list[str]:
+        if self._tables is None:
+            data = await self._post("/api/1/reserve/available_restaurant_sections", {
+                "terminalGroupIds": [group],
+            })
+            self._tables = [
+                t["id"] for s in data.get("restaurantSections") or [] for t in s.get("tables") or []
+            ]
+            if not self._tables:
+                raise IikoError("в iiko нет ни одного стола, заказы читать неоткуда")
+        return self._tables
+
+    async def orders(self) -> list[CashOrder]:
+        """Заказы со всех столов за последние сутки: открытые, оплаченные и удалённые.
+
+        На стенде облако видело заказ с кассы только после того, как его попросили
+        прислать заказы по столам (init_by_table). Поэтому сначала просим, потом читаем.
+        Бывает, что касса отвечает на просьбу ошибкой, а заказы всё равно приходят,
+        поэтому ошибку только пишем в лог.
+        """
+        org, group = await self._ids()
+        # Если iikoFront выключен, облако отдало бы старые заказы без ошибки. Проверяем сами.
+        alive = await self._post("/api/1/terminal_groups/is_alive", {
+            "organizationIds": [org], "terminalGroupIds": [group],
+        })
+        if not any(a.get("isAlive") for a in alive.get("isAliveStatus") or []):
+            raise IikoError("касса iikoFront не на связи (выключена или нет интернета)")
+        tables = await self._tables_ids(org, group)
+        data = await self._post("/api/1/order/init_by_table", {
+            "organizationId": org, "terminalGroupId": group, "tableIds": tables,
+        })
+        for _ in range(STATUS_TRIES):
+            await asyncio.sleep(STATUS_PAUSE)
+            status = await self._post("/api/1/commands/status", {
+                "organizationId": org, "correlationId": data["correlationId"],
+            })
+            if status.get("state") != "InProgress":
+                if status.get("state") == "Error":
+                    logging.info("iiko: касса ответила на запрос заказов: %s", status.get("exception"))
+                break
+        since = datetime.now() - timedelta(days=1)
+        data = await self._post("/api/1/order/by_table", {
+            "organizationIds": [org], "tableIds": tables,
+            "statuses": ["New", "Bill", "Closed", "Deleted"],
+            "dateFrom": since.strftime("%Y-%m-%d %H:%M:%S.000"),
+        })
+        return [o for o in map(_cash_order, data.get("orders") or []) if o]
