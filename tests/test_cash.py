@@ -1,10 +1,10 @@
 """Продажи с кассы iiko (раздел 4) без выхода в интернет: заказы подставляем сами."""
 
 import asyncio
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 from bot import stock
-from bot.cash import CashWatch, cash_tick
+from bot.cash import MOSCOW, CashWatch, cash_tick, kitchen_open
 from bot.iiko import CashItem, CashOrder, IikoError, _cash_order
 from tests.test_dialogs import Harness
 
@@ -143,11 +143,12 @@ class BrokenIiko:
 def test_chef_is_told_when_orders_are_not_visible_for_10_minutes():
     h, _ = _setup()
     iiko = BrokenIiko()
-    watch = CashWatch(since=SINCE, last_ok=SINCE)
+    noon = datetime(2026, 10, 18, 12, 0, tzinfo=MOSCOW)
+    watch = CashWatch(since=SINCE, last_ok=noon)
 
     def tick(minutes):
         before = len(h.session.sent)
-        now = SINCE + timedelta(minutes=minutes)
+        now = noon + timedelta(minutes=minutes)
         asyncio.run(cash_tick(h.bot, iiko, h.router.apply_cash, h.chefs, watch, now))
         return h.session.sent[before:]
 
@@ -157,3 +158,23 @@ def test_chef_is_told_when_orders_are_not_visible_for_10_minutes():
     iiko.broken = False
     assert tick(12) == ["✅ Снова вижу заказы из iiko."]
     assert tick(13) == []
+
+
+def test_no_warning_while_kitchen_is_closed():
+    h, _ = _setup()
+    iiko = BrokenIiko()  # ночью касса выключена
+    night = datetime(2026, 10, 18, 2, 0, tzinfo=MOSCOW)
+    watch = CashWatch(since=SINCE, last_ok=night)
+
+    def tick(at):
+        before = len(h.session.sent)
+        asyncio.run(cash_tick(h.bot, iiko, h.router.apply_cash, h.chefs, watch, at))
+        return h.session.sent[before:]
+
+    assert tick(datetime(2026, 10, 18, 10, 59, tzinfo=MOSCOW)) == []
+    assert tick(datetime(2026, 10, 18, 11, 5, tzinfo=MOSCOW)) == []  # 10 минут с открытия
+    assert "Не вижу заказы" in tick(datetime(2026, 10, 18, 11, 10, tzinfo=MOSCOW))[0]
+    # компьютер с ботом может жить по другому времени: 13:00 в Екатеринбурге = 11:00 в Москве
+    ekb = timezone(timedelta(hours=5))
+    assert kitchen_open(datetime(2026, 10, 18, 13, 0, tzinfo=ekb))
+    assert not kitchen_open(datetime(2026, 10, 18, 23, 30, tzinfo=MOSCOW))

@@ -8,7 +8,7 @@ import asyncio
 import logging
 import sqlite3
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import datetime, time, timedelta, timezone
 
 from aiogram import Bot
 
@@ -18,6 +18,13 @@ from bot.iiko import IikoClient, IikoError
 
 CASH_EVERY_SECONDS = 30
 SILENCE = timedelta(minutes=10)  # раздел 8: столько без связи с iiko, и пишем су-шефу
+MOSCOW = timezone(timedelta(hours=3))  # в Москве нет перехода на летнее время с 2014 года
+WORK_FROM, WORK_TO = time(11, 0), time(23, 0)  # кухня работает, по Москве (Даниил, 18.10)
+
+
+def kitchen_open(now: datetime) -> bool:
+    """now — время компьютера с ботом. Оно может быть не московским, поэтому переводим."""
+    return WORK_FROM <= now.astimezone(MOSCOW).time() < WORK_TO
 
 
 @dataclass
@@ -31,12 +38,15 @@ async def cash_tick(
     bot: Bot, iiko: IikoClient, apply_cash, sous_chef_ids, watch: CashWatch, now: datetime
 ) -> None:
     """Один опрос. Ошибка iiko не останавливает бота: пишем в лог, а после 10 минут
-    без связи один раз говорим су-шефу. Когда связь вернулась, тоже говорим."""
+    без связи один раз говорим су-шефу. Когда связь вернулась, тоже говорим.
+    Пока кухня закрыта, су-шефу не пишем: ночью касса выключена, это нормально."""
+    if not kitchen_open(now):
+        watch.last_ok, watch.warned = now, False  # 10 минут считаем с открытия
     try:
         orders = await iiko.orders()
     except IikoError as e:
         logging.warning("iiko: заказы не прочитал: %s", e)
-        if not watch.warned and now - watch.last_ok >= SILENCE:
+        if kitchen_open(now) and not watch.warned and now - watch.last_ok >= SILENCE:
             watch.warned = True
             await send_to_chefs(
                 bot, as_ids(sous_chef_ids),

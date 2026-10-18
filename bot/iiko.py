@@ -213,6 +213,12 @@ class IikoClient:
         поэтому ошибку только пишем в лог.
         """
         org, group = await self._ids()
+        # Если iikoFront выключен, облако отдало бы старые заказы без ошибки. Проверяем сами.
+        alive = await self._post("/api/1/terminal_groups/is_alive", {
+            "organizationIds": [org], "terminalGroupIds": [group],
+        })
+        if not any(a.get("isAlive") for a in alive.get("isAliveStatus") or []):
+            raise IikoError("касса iikoFront не на связи (выключена или нет интернета)")
         tables = await self._tables_ids(org, group)
         data = await self._post("/api/1/order/init_by_table", {
             "organizationId": org, "terminalGroupId": group, "tableIds": tables,
