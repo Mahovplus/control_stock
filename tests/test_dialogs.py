@@ -62,13 +62,13 @@ class FakeSession(BaseSession):
 
 
 class Harness:
-    def __init__(self, waiters=WAITERS, chefs=(CHEF,)):
+    def __init__(self, waiters=WAITERS, chefs=(CHEF,), iiko=None):
         self.conn = connect(":memory:")
         self.session = FakeSession()
         self.bot = Bot("42:TEST", session=self.session)
         self.dp = Dispatcher()
         self.chefs = list(chefs)
-        self.dp.include_router(make_router(self.conn, self.chefs, waiters))
+        self.dp.include_router(make_router(self.conn, self.chefs, waiters, iiko))
         self.n = 0
 
     def to_waiters(self) -> list[str]:

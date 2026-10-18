@@ -89,6 +89,25 @@ def add_dish(conn: sqlite3.Connection, name: str, kind: str = PORTION) -> Dish:
     return get_dish(conn, cur.lastrowid)
 
 
+def set_iiko_id(conn: sqlite3.Connection, dish_id: int, iiko_id: str) -> None:
+    """Связь блюда с меню iiko (раздел 8): по этому коду бот ставит и снимает стоп."""
+    with conn:
+        conn.execute("UPDATE dishes SET iiko_id = ? WHERE id = ?", (iiko_id, dish_id))
+
+
+def get_iiko_id(conn: sqlite3.Connection, dish_id: int) -> str | None:
+    row = conn.execute("SELECT iiko_id FROM dishes WHERE id = ?", (dish_id,)).fetchone()
+    return row["iiko_id"] if row else None
+
+
+def unlinked_dishes(conn: sqlite3.Connection) -> list[Dish]:
+    """Блюда на контроле, которые ещё не связаны с iiko."""
+    rows = conn.execute(
+        "SELECT * FROM dishes WHERE archived = 0 AND iiko_id IS NULL ORDER BY name"
+    ).fetchall()
+    return [_to_dish(conn, r) for r in rows]
+
+
 def get_dish(conn: sqlite3.Connection, dish_id: int) -> Dish:
     row = conn.execute("SELECT * FROM dishes WHERE id = ?", (dish_id,)).fetchone()
     if row is None:
