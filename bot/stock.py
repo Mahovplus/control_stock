@@ -442,3 +442,175 @@ def piece_missing(conn: sqlite3.Connection, piece_id: int, who: str) -> Dish:
             (f"расхождение: нет куска {piece['grams']} г",),
         )
     return get_dish(conn, dish.id)
+
+
+# --- Продажи с кассы iiko (раздел 4) --------------------------------------
+
+@dataclass
+class CashPosition:
+    position_id: str
+    dish_id: int
+    qty: int
+    counted: int  # сколько порций реально ушло «в работу»
+    state: str
+    note: str | None
+
+
+def dish_by_iiko_id(conn: sqlite3.Connection, iiko_id: str) -> Dish | None:
+    """Порционное блюдо на контроле по коду из меню iiko. Нет такого — None."""
+    row = conn.execute(
+        "SELECT * FROM dishes WHERE iiko_id = ? AND archived = 0", (iiko_id,)
+    ).fetchone()
+    return _to_dish(conn, row) if row else None
+
+
+def cash_since(conn: sqlite3.Connection, now: datetime) -> datetime:
+    """С какого времени бот считает чеки с кассы: с первого запуска с iiko.
+
+    Заказы, отправленные на кухню раньше, бот не считает, иначе первый запуск
+    снял бы с остатка всё, что пробили за день до него.
+    """
+    row = conn.execute("SELECT value FROM settings WHERE key = 'cash_since'").fetchone()
+    if row:
+        return datetime.strptime(str(row["value"]), "%Y%m%d%H%M%S")
+    with conn:
+        conn.execute(
+            "INSERT INTO settings (key, value, changed_by) VALUES ('cash_since', ?, 'iiko')",
+            (int(now.strftime("%Y%m%d%H%M%S")),),
+        )
+    return now.replace(microsecond=0)
+
+
+def cash_position(conn: sqlite3.Connection, position_id: str) -> CashPosition | None:
+    row = conn.execute(
+        "SELECT * FROM cash_positions WHERE position_id = ?", (position_id,)
+    ).fetchone()
+    if row is None:
+        return None
+    return CashPosition(
+        row["position_id"], row["dish_id"], row["qty"], row["counted"], row["state"], row["note"]
+    )
+
+
+def cash_sale(
+    conn: sqlite3.Connection, position_id: str, order_id: str, dish_id: int, qty: int
+) -> list[SaleResult]:
+    """Позицию отправили на кухню: каждая порция как обычная продажа (свободно −1, в работе +1)."""
+    results = [sell(conn, dish_id, "iiko") for _ in range(qty)]
+    counted = sum(1 for r in results if not r.oversold)
+    with conn:
+        conn.execute(
+            "INSERT INTO cash_positions (position_id, order_id, dish_id, qty, counted) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (position_id, order_id, dish_id, qty, counted),
+        )
+    return results
+
+
+def _leave_work(conn: sqlite3.Connection, pos: CashPosition, state: str, column: str | None) -> None:
+    """Порции позиции уходят из «в работе» (в проданные, списанные или обратно)."""
+    if column:
+        conn.execute(
+            f"UPDATE dishes SET in_work = MAX(in_work - ?, 0), {column} = {column} + ? WHERE id = ?",
+            (pos.counted, pos.counted, pos.dish_id),
+        )
+    else:
+        conn.execute(
+            "UPDATE dishes SET in_work = MAX(in_work - ?, 0) WHERE id = ?", (pos.counted, pos.dish_id)
+        )
+    conn.execute(
+        "UPDATE cash_positions SET state = ? WHERE position_id = ?", (state, pos.position_id)
+    )
+
+
+def cash_paid(conn: sqlite3.Connection, position_id: str) -> bool:
+    """Чек оплачен: в работе −N, продано +N. False, если позицию уже закрыли раньше.
+
+    Порции «сверх остатка» здесь не трогаем: их в «в работу» переносит пополнение.
+    """
+    pos = cash_position(conn, position_id)
+    if pos is None or pos.state != "in_work":
+        return False
+    with conn:
+        _leave_work(conn, pos, "sold", "sold")
+        conn.execute(
+            "INSERT INTO journal (dish_id, action, delta, free_after, who) "
+            "SELECT id, 'sold', 0, free, 'iiko' FROM dishes WHERE id = ?",
+            (pos.dish_id,),
+        )
+    return True
+
+
+def cash_refused(conn: sqlite3.Connection, position_id: str, note: str) -> bool:
+    """Позицию удалили после кухни: ждём решения су-шефа. True, если надо спросить.
+
+    Если все порции были сверх остатка, спрашивать не о чем: просто снимаем
+    эти «сверх остатка», чтобы пополнение их не закрывало.
+    """
+    pos = cash_position(conn, position_id)
+    if pos is None or pos.state != "in_work":
+        return False
+    extra = pos.qty - pos.counted
+    with conn:
+        if extra:
+            conn.execute(
+                "UPDATE oversells SET resolved_at = datetime('now', 'localtime') WHERE id IN ("
+                "SELECT id FROM oversells WHERE dish_id = ? AND resolved_at IS NULL "
+                "ORDER BY id DESC LIMIT ?)",
+                (pos.dish_id, extra),
+            )
+        state = "refused" if pos.counted else "returned"
+        conn.execute(
+            "UPDATE cash_positions SET state = ?, note = ? WHERE position_id = ?",
+            (state, note, position_id),
+        )
+    return pos.counted > 0
+
+
+def refusal_return(conn: sqlite3.Connection, position_id: str, who: str) -> tuple[Dish, Dish, int]:
+    """«Вернуть в остаток»: в работе −N, дальше как пополнение на N.
+
+    Возвращает (блюдо до, блюдо после, N), чтобы бот сказал про выход из стопа.
+    """
+    pos = _refused(conn, position_id)
+    before = get_dish(conn, pos.dish_id)
+    with conn:
+        _leave_work(conn, pos, "returned", None)
+    dish = replenish(conn, pos.dish_id, pos.counted, who)
+    with conn:
+        conn.execute(
+            "UPDATE journal SET action = 'refusal_return', comment = ? "
+            "WHERE id = (SELECT MAX(id) FROM journal)",
+            (f"отказ гостя: {pos.note}",),
+        )
+    return before, dish, pos.counted
+
+
+def refusal_write_off(conn: sqlite3.Connection, position_id: str, who: str) -> Dish:
+    """«Списать»: в работе −N, списано +N. Комментарий су-шефа добавит add_write_off_comment."""
+    pos = _refused(conn, position_id)
+    with conn:
+        _leave_work(conn, pos, "written_off", "written_off")
+        conn.execute(
+            "INSERT INTO journal (dish_id, action, delta, free_after, who, comment) "
+            "SELECT id, 'write_off', 0, free, ?, ? FROM dishes WHERE id = ?",
+            (who, f"отказ гостя: {pos.note}", pos.dish_id),
+        )
+    return get_dish(conn, pos.dish_id)
+
+
+def add_write_off_comment(conn: sqlite3.Connection, dish_id: int, comment: str) -> None:
+    """Причина списания от су-шефа: дописываем к последнему списанию этого блюда."""
+    with conn:
+        conn.execute(
+            "UPDATE journal SET comment = comment || '. Су-шеф: ' || ? WHERE id = ("
+            "SELECT MAX(id) FROM journal WHERE dish_id = ? AND action = 'write_off')",
+            (comment.strip(), dish_id),
+        )
+
+
+def _refused(conn: sqlite3.Connection, position_id: str) -> CashPosition:
+    pos = cash_position(conn, position_id)
+    if pos is None or pos.state != "refused":
+        raise StockError("По этому отказу уже решили.")
+    return pos

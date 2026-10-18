@@ -7,7 +7,8 @@
 - timers: когда спросить су-шефа «готово?» (раздел 6);
 - reminders: одно напоминание су-шефу, если он не ответил (раздел 6);
 - pieces: куски штучных весовых блюд, у каждого свой вес (раздел 7в);
-- settings: порог и время напоминания, которые су-шеф поменял кнопками (раздел 14).
+- settings: порог и время напоминания, которые су-шеф поменял кнопками (раздел 14);
+- cash_positions: позиции заказов с кассы iiko, которые бот уже посчитал (раздел 4).
 """
 
 import sqlite3
@@ -71,6 +72,17 @@ CREATE TABLE IF NOT EXISTS settings (
     value      INTEGER NOT NULL,
     changed_by TEXT,
     changed_at TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
+);
+
+CREATE TABLE IF NOT EXISTS cash_positions (
+    position_id TEXT PRIMARY KEY,   -- позиция заказа в iiko: по ней не считаем дважды
+    order_id    TEXT NOT NULL,
+    dish_id     INTEGER NOT NULL REFERENCES dishes(id),
+    qty         INTEGER NOT NULL,   -- сколько порций пробили
+    counted     INTEGER NOT NULL,   -- из них ушло «в работу», остальные сверх остатка
+    state       TEXT NOT NULL DEFAULT 'in_work',  -- in_work, sold, refused, returned, written_off
+    note        TEXT,               -- тип удаления и комментарий официанта из iiko
+    at          TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 """
 

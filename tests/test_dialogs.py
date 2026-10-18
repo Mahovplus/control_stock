@@ -68,7 +68,8 @@ class Harness:
         self.bot = Bot("42:TEST", session=self.session)
         self.dp = Dispatcher()
         self.chefs = list(chefs)
-        self.dp.include_router(make_router(self.conn, self.chefs, waiters, iiko))
+        self.router = make_router(self.conn, self.chefs, waiters, iiko)
+        self.dp.include_router(self.router)
         self.n = 0
 
     def to_waiters(self) -> list[str]:

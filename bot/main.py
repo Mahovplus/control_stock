@@ -1,7 +1,7 @@
 """Точка запуска: python -m bot.main
 
-Открывает базу, подключает кнопки су-шефа, запускает проверку таймеров
-копию базы раз в день и начинает слушать Telegram.
+Открывает базу, подключает кнопки су-шефа, запускает проверку таймеров,
+копию базы раз в день, опрос кассы iiko (если есть ключи) и начинает слушать Telegram.
 """
 
 import asyncio
@@ -14,6 +14,7 @@ from aiogram import Bot, Dispatcher
 
 from bot import stock
 from bot.backup import backup_dir_for
+from bot.cash import cash_loop
 from bot.config import load_config
 from bot.db import connect
 from bot.handlers import link_with_iiko, make_router
@@ -63,14 +64,20 @@ async def main() -> None:
         await link_old_dishes(conn, iiko)
     else:
         logging.info("iiko не подключена: ключей IIKO_ нет в .env, стоп в iiko вручную")
-    dp.include_router(make_router(conn, config.sous_chef_ids, config.waiters_chat_id, iiko))
-    timers = asyncio.create_task(  # фоном
+    router = make_router(conn, config.sous_chef_ids, config.waiters_chat_id, iiko)
+    dp.include_router(router)
+    background = [asyncio.create_task(  # фоном
         timer_loop(bot, conn, config.sous_chef_ids, backup_dir_for(config.db_path))
-    )
+    )]
+    if iiko:
+        background.append(asyncio.create_task(
+            cash_loop(bot, conn, iiko, router.apply_cash, config.sous_chef_ids)
+        ))
     try:
         await dp.start_polling(bot)  # опрос Telegram: внешний адрес сервера не нужен
     finally:
-        timers.cancel()
+        for task in background:
+            task.cancel()
 
 
 if __name__ == "__main__":
