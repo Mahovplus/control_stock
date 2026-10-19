@@ -85,6 +85,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_SALE), KeyboardButton(text=BTN_SETTINGS)],
     ],
     resize_keyboard=True,
+    is_persistent=True,  # Telegram не прячет меню, даже когда у сообщения свои кнопки
 )
 
 
