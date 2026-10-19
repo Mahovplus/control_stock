@@ -85,6 +85,7 @@ MAIN_MENU = ReplyKeyboardMarkup(
         [KeyboardButton(text=BTN_SALE), KeyboardButton(text=BTN_SETTINGS)],
     ],
     resize_keyboard=True,
+    is_persistent=True,  # Telegram не прячет меню, даже когда у сообщения свои кнопки
 )
 
 
@@ -649,26 +650,59 @@ def make_router(
         for order in orders:
             for item in order.items:
                 dish = stock.dish_by_iiko_id(conn, item.product_id)
-                if dish is None or dish.kind == stock.WEIGHT:
-                    continue  # весовые пока только кнопкой: из чека не понять, какой кусок
+                if dish is None:
+                    continue
                 deleted = item.deleted or order.status == "Deleted"
                 pos = stock.cash_position(conn, item.position_id)
                 if pos is None:
                     if deleted or item.printed is None or item.printed < since:
                         continue  # удалили до кухни, ещё не отправили или было до бота
-                    if item.amount != int(item.amount) or item.amount < 1:
+                    if dish.kind == stock.WEIGHT:  # в чеке вес в кг: 0,55 = кусок 550 г
+                        grams = round(item.amount * 1000)
+                        result = stock.cash_piece_sale(conn, item.position_id, order.id, dish.id, grams)
+                        if result is None:
+                            await ask_piece(bot, item.position_id)
+                        else:
+                            await report_sale(bot, result)
+                    elif item.amount != int(item.amount) or item.amount < 1:
                         logging.warning("iiko: %s ×%s, не целое число порций", dish.name, item.amount)
                         continue
-                    sales = stock.cash_sale(
-                        conn, item.position_id, order.id, dish.id, int(item.amount)
-                    )
-                    for result in sales:
-                        await report_sale(bot, result)
+                    else:
+                        sales = stock.cash_sale(
+                            conn, item.position_id, order.id, dish.id, int(item.amount)
+                        )
+                        for result in sales:
+                            await report_sale(bot, result)
                 if deleted:
+                    stock.cash_unpicked(conn, item.position_id)
                     if stock.cash_refused(conn, item.position_id, item.note or "без комментария"):
                         await ask_refusal(bot, item.position_id)
                 elif order.status == "Closed":
                     stock.cash_paid(conn, item.position_id)
+
+    async def ask_piece(bot: Bot, position_id: str) -> None:
+        """Раздел 7в, п. 6: в чеке вес, а куска с точно таким весом нет."""
+        pos = stock.cash_position(conn, position_id)
+        dish = stock.get_dish(conn, pos.dish_id)
+        pieces = stock.free_pieces(conn, dish.id)
+        have = ", ".join(f"{g}" for _, g in pieces)
+        await send_to_chefs(
+            bot, chefs,
+            f"⚖️ Шеф, {dish.name}: пробили {pos.grams / 1000:.3f}".replace(".", ",")
+            + f", а у меня {have} г. Какой снять?",
+            reply_markup=pieces_keyboard(pieces, f"cp:{position_id}"),
+        )
+
+    @router.callback_query(F.data.startswith("cp:"))
+    async def piece_pick(call: CallbackQuery) -> None:
+        await call.answer()
+        _, position_id, piece_id = call.data.split(":")
+        try:
+            result = stock.piece_chosen(conn, position_id, int(piece_id), who(call.from_user.id))
+        except stock.StockError as e:
+            await call.message.answer(str(e))
+            return
+        await report_sale(call.bot, result, call.message)
 
     async def ask_refusal(bot: Bot, position_id: str) -> None:
         pos = stock.cash_position(conn, position_id)

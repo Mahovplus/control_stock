@@ -82,6 +82,8 @@ CREATE TABLE IF NOT EXISTS cash_positions (
     counted     INTEGER NOT NULL,   -- из них ушло «в работу», остальные сверх остатка
     state       TEXT NOT NULL DEFAULT 'in_work',  -- in_work, sold, refused, returned, written_off
     note        TEXT,               -- тип удаления и комментарий официанта из iiko
+    grams       INTEGER,            -- весовое блюдо: вес из чека
+    piece_id    INTEGER REFERENCES pieces(id),  -- весовое блюдо: какой кусок сняли
     at          TEXT NOT NULL DEFAULT (datetime('now', 'localtime'))
 );
 """
@@ -93,6 +95,10 @@ NEW_COLUMNS = {
         ("low_alerted", "INTEGER NOT NULL DEFAULT 0"),
         ("kind", "TEXT NOT NULL DEFAULT 'portion'"),
         ("archived", "INTEGER NOT NULL DEFAULT 0"),
+    ],
+    "cash_positions": [
+        ("grams", "INTEGER"),
+        ("piece_id", "INTEGER REFERENCES pieces(id)"),
     ],
 }
 
