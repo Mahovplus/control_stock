@@ -111,3 +111,15 @@ flowchart TB
   bot -->|"передать на разбор"| parse
   parse -->|"Команда/действие"| bot
   bot -->|"Запрос/команда в Core"| core
+
+## Установка на сервер (Ubuntu 24.04)
+
+Бот работает только с облаком iiko и Telegram, поэтому сервер может быть где угодно. От root:
+
+```
+curl -fsSL https://raw.githubusercontent.com/Mahovplus/control_stock/main/deploy/ustanovka.sh | bash
+nano /opt/control_stock/.env        # вписать ключи
+systemctl restart ostatki-bot
+```
+
+Обновить бота: та же первая команда. Посмотреть, что с ботом: `systemctl status ostatki-bot` и `journalctl -u ostatki-bot -n 50`.
