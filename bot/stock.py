@@ -454,6 +454,8 @@ class CashPosition:
     counted: int  # сколько порций реально ушло «в работу»
     state: str
     note: str | None
+    grams: int | None = None     # весовое блюдо: вес из чека
+    piece_id: int | None = None  # весовое блюдо: снятый кусок
 
 
 def dish_by_iiko_id(conn: sqlite3.Connection, iiko_id: str) -> Dish | None:
@@ -488,7 +490,8 @@ def cash_position(conn: sqlite3.Connection, position_id: str) -> CashPosition | 
     if row is None:
         return None
     return CashPosition(
-        row["position_id"], row["dish_id"], row["qty"], row["counted"], row["state"], row["note"]
+        row["position_id"], row["dish_id"], row["qty"], row["counted"], row["state"], row["note"],
+        row["grams"], row["piece_id"],
     )
 
 
@@ -507,8 +510,61 @@ def cash_sale(
     return results
 
 
+def cash_piece_sale(
+    conn: sqlite3.Connection, position_id: str, order_id: str, dish_id: int, grams: int
+) -> SaleResult | None:
+    """Весовое блюдо отправили на кухню (раздел 7в, п. 6). Кусок с точно таким весом
+    сразу уходит «в работу». Нет такого куска, но свободные есть: None, позиция ждёт,
+    пока су-шеф выберет кусок (piece_chosen). Свободных нет: «сверх остатка», как у порций."""
+    piece_id = find_piece(conn, dish_id, grams)
+    if piece_id is None and free_pieces(conn, dish_id):
+        with conn:
+            conn.execute(
+                "INSERT INTO cash_positions (position_id, order_id, dish_id, qty, counted, state, grams) "
+                "VALUES (?, ?, ?, 1, 0, 'pick', ?)",
+                (position_id, order_id, dish_id, grams),
+            )
+        return None
+    result = sell_piece(conn, piece_id, "iiko") if piece_id else sell(conn, dish_id, "iiko")
+    with conn:
+        conn.execute(
+            "INSERT INTO cash_positions (position_id, order_id, dish_id, qty, counted, grams, piece_id) "
+            "VALUES (?, ?, ?, 1, ?, ?, ?)",
+            (position_id, order_id, dish_id, 0 if result.oversold else 1, grams, piece_id),
+        )
+    return result
+
+
+def piece_chosen(conn: sqlite3.Connection, position_id: str, piece_id: int, who: str) -> SaleResult:
+    """Су-шеф выбрал, какой кусок пробили: он уходит «в работу»."""
+    pos = cash_position(conn, position_id)
+    if pos is None or pos.state != "pick":
+        raise StockError("По этому чеку уже решили.")
+    result = sell_piece(conn, piece_id, who)
+    with conn:
+        conn.execute(
+            "UPDATE cash_positions SET state = 'in_work', counted = 1, piece_id = ? "
+            "WHERE position_id = ?",
+            (piece_id, position_id),
+        )
+    return result
+
+
+def cash_unpicked(conn: sqlite3.Connection, position_id: str) -> None:
+    """Позицию удалили, пока су-шеф не выбрал кусок: ничего не снимали, вопрос снимаем."""
+    with conn:
+        conn.execute(
+            "UPDATE cash_positions SET state = 'returned' WHERE position_id = ? AND state = 'pick'",
+            (position_id,),
+        )
+
+
 def _leave_work(conn: sqlite3.Connection, pos: CashPosition, state: str, column: str | None) -> None:
     """Порции позиции уходят из «в работе» (в проданные, списанные или обратно)."""
+    if pos.piece_id and pos.counted:  # у весового блюда кусок идёт туда же
+        piece_state = {"sold": "sold", "written_off": "written_off"}.get(state)
+        if piece_state:
+            conn.execute("UPDATE pieces SET state = ? WHERE id = ?", (piece_state, pos.piece_id))
     if column:
         conn.execute(
             f"UPDATE dishes SET in_work = MAX(in_work - ?, 0), {column} = {column} + ? WHERE id = ?",
@@ -577,6 +633,13 @@ def refusal_return(conn: sqlite3.Connection, position_id: str, who: str) -> tupl
     with conn:
         _leave_work(conn, pos, "returned", None)
     dish = replenish(conn, pos.dish_id, pos.counted, who)
+    if pos.piece_id:  # кусок снова свободен, а если закрыл «сверх остатка», сразу в работе
+        covered = pos.counted - (dish.free - before.free)
+        with conn:
+            conn.execute(
+                "UPDATE pieces SET state = ? WHERE id = ?",
+                ("in_work" if covered else "free", pos.piece_id),
+            )
     with conn:
         conn.execute(
             "UPDATE journal SET action = 'refusal_return', comment = ? "

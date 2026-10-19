@@ -181,3 +181,80 @@ def test_no_warning_while_kitchen_is_closed():
     ekb = timezone(timedelta(hours=5))
     assert kitchen_open(datetime(2026, 10, 18, 13, 0, tzinfo=ekb))
     assert not kitchen_open(datetime(2026, 10, 18, 23, 30, tzinfo=MOSCOW))
+
+
+# --- Весовые блюда с кассы (раздел 7в, п. 6) --------------------------------
+
+def _rib(*grams):
+    h = Harness()
+    dish = stock.add_dish(h.conn, "Ребро телёнка", stock.WEIGHT)
+    stock.set_iiko_id(h.conn, dish.id, "rib-id")
+    if grams:
+        stock.add_pieces(h.conn, dish.id, list(grams), "test")
+    return h, dish
+
+
+def _rib_order(status="New", kg=0.55, deleted=False, pos="rib-1"):
+    # так вес пришёл на стенде 19.10: amount 0.55 у блюда в кг
+    return CashOrder("order-2", status, [CashItem(pos, "rib-id", kg, PRINTED, deleted, "")])
+
+
+def _states(h):
+    return [r[0] for r in h.conn.execute("SELECT state FROM pieces ORDER BY grams")]
+
+
+def test_weight_piece_with_same_weight_goes_to_work_then_sold():
+    h, dish = _rib(480, 550, 620)
+    assert _poll(h, _rib_order()) == []
+    assert _states(h) == ["free", "in_work", "free"]
+    assert stock.get_dish(h.conn, dish.id).free == 2
+    _poll(h, _rib_order("Closed"))
+    assert _states(h) == ["free", "sold", "free"]
+    assert _row(h, dish)["in_work"] == 0 and _row(h, dish)["sold"] == 1
+
+
+def test_weight_not_found_asks_chef_which_piece():
+    h, dish = _rib(550, 620)
+    out = _poll(h, _rib_order(kg=0.56))
+    assert out == ["⚖️ Шеф, Ребро телёнка: пробили 0,560, а у меня 550, 620 г. Какой снять?"]
+    assert _poll(h, _rib_order(kg=0.56)) == []  # повторно не спрашиваем
+    piece_620 = stock.free_pieces(h.conn, dish.id)[1][0]
+    out = h.press(f"cp:rib-1:{piece_620}")
+    assert out[0] == "Пробито: Ребро телёнка, свободно 1."
+    assert _states(h) == ["free", "in_work"]
+    assert "уже решили" in h.press(f"cp:rib-1:{piece_620}")[0]
+
+
+def test_weight_deleted_before_chef_picked_needs_nothing():
+    h, dish = _rib(550, 620)
+    _poll(h, _rib_order(kg=0.56))
+    assert _poll(h, _rib_order("Deleted", kg=0.56, deleted=True)) == []
+    assert _states(h) == ["free", "free"]
+    assert "уже решили" in h.press(f"cp:rib-1:{stock.free_pieces(h.conn, dish.id)[0][0]}")[0]
+
+
+def test_weight_refusal_return_frees_the_same_piece():
+    h, dish = _rib(550)
+    out = _poll(h, _rib_order())
+    assert "закончилось, ставлю в стоп" in out[-1]  # последний кусок
+    _poll(h, _rib_order("Deleted", deleted=True))
+    out = h.press("rfb:rib-1")
+    assert "вышло из стопа" in out[0]
+    assert stock.free_pieces(h.conn, dish.id) == [(1, 550)]
+    assert _row(h, dish)["in_work"] == 0
+
+
+def test_weight_refusal_write_off_marks_piece():
+    h, dish = _rib(550, 620)
+    _poll(h, _rib_order())
+    _poll(h, _rib_order("Deleted", deleted=True))
+    h.press("rfw:rib-1")
+    assert _states(h) == ["written_off", "free"]
+    assert _row(h, dish)["written_off"] == 1
+
+
+def test_weight_without_pieces_is_oversell():
+    h, dish = _rib()
+    out = _poll(h, _rib_order())
+    assert "пробили, а порций нет" in out[0]
+    assert stock.pending_oversells(h.conn, dish.id) == 1
