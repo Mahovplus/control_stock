@@ -70,7 +70,8 @@ def _cash_order(raw: dict) -> CashOrder | None:
         if deleted:
             method = deleted.get("deletionMethod") or {}
             removal = (method.get("removalType") or {}).get("name") or ""
-            note = ", ".join(x for x in (removal, method.get("comment") or "") if x)
+            comment = " ".join((method.get("comment") or "").split()).strip(" .")  # без переносов строк
+            note = ", ".join(x for x in (removal, comment) if x)
         items.append(CashItem(
             i["positionId"], product["id"], float(i.get("amount") or 0),
             _iiko_time(i.get("whenPrinted")), bool(deleted), note,

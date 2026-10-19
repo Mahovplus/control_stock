@@ -128,6 +128,9 @@ def test_order_from_iiko_is_read():
         "With write-off, удаление тест",
     )]
     assert _cash_order({"id": "x", "order": None}) is None
+    # официант написал комментарий в несколько строк с точкой (стенд, 19.10)
+    raw["order"]["items"][0]["deleted"]["deletionMethod"]["comment"] = "\n\nтест\n."
+    assert _cash_order(raw).items[0].note == "With write-off, тест"
 
 
 class BrokenIiko:
