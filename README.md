@@ -75,48 +75,48 @@ python3 -m pytest
 | `bot/iiko.py` | Связь с iiko Cloud API: меню, поставить и снять стоп, заказы с кассы |
 | `bot/cash.py` | Опрос кассы iiko раз в 30 секунд |
 | `bot/config.py` | Читает токен и настройки из `.env` |
+| `bot/backup.py` | Копия базы раз в день в `data/backup/`, хранит последние 14 |
 | `bot/main.py` | Запуск бота |
+| `deploy/ustanovka.sh` | Установка на сервер Ubuntu с автозапуском |
 | `assets/welcome.png` | Картинка к приветствию на /start и /help |
 
-## Architecture (Context)
+## Как устроен бот
+
+Один процесс Python (`python -m bot.main`) и один файл базы SQLite. Внутри процесса бот принимает сообщения Telegram (long polling, внешний адрес сервера не нужен) и крутит два фоновых цикла asyncio раз в 30 секунд: таймеры «готово?» с копией базы раз в день и опрос кассы iiko. Опрос кассы запускается, только если в `.env` есть ключи iiko. Отдельного сервера, очереди сообщений или другой базы нет.
 
 ```mermaid
-flowchart TB
-  subgraph External["Внешние системы"]
-    iiko["iiko"]
-    tgapi["Telegram Bot API"]
-    chat["Чат сотрудников (Telegram)"]
+flowchart LR
+  tg["Telegram Bot API"]
+  iiko["iiko Cloud API"]
+
+  subgraph Proc["Процесс бота: python -m bot.main"]
+    poll["Приём сообщений Telegram<br/>handlers.py"]
+    timers["timer_loop, раз в 30 с<br/>timers.py"]
+    cash["cash_loop, раз в 30 с<br/>cash.py, только с ключами iiko"]
+    stock["Правила подсчёта<br/>stock.py"]
   end
 
-  subgraph OurSystem["Наша система"]
-    integr["iiko Integration Worker"]
-    core["Core Backend"]
-    db[("PostgreSQL")]
-    outboxW["Outbox Worker"]
-    bot["Bot Service"]
-    parse["Validate & Parse (внутренний шаг бота)"]
-  end
+  db[("SQLite<br/>data/ostatki.db")]
+  backup[("Копии базы<br/>data/backup/")]
 
-  iiko -->|"Webhook (push) или Polling (pull)"| integr
-  integr -->|"Нормализованное событие (позиции, qty)"| core
+  tg <-->|"кнопки су-шефа и ответы"| poll
+  poll -->|"меню, стоп и снятие стопа"| iiko
+  cash -->|"заказы с кассы, стоп при 0"| iiko
+  timers -->|"«готово?», напоминания"| tg
+  cash -->|"су-шефу и официантам"| tg
 
-  core -->|"Обновить остатки + записать событие"| db
-  core -->|"Записать outbox-сообщение (нужно уведомить)"| db
-
-  outboxW -->|"Прочитать pending outbox"| db
-  outboxW -->|"sendMessage/editMessage"| tgapi
-  tgapi -->|"Доставка"| chat
-
-  tgapi -->|"Updates (команды/кнопки)"| bot
-  bot -->|"передать на разбор"| parse
-  parse -->|"Команда/действие"| bot
-  bot -->|"Запрос/команда в Core"| core
+  poll --> stock
+  timers --> stock
+  cash --> stock
+  stock --> db
+  timers -->|"раз в день"| backup
+```
 
 ## Установка на сервер (Ubuntu 24.04)
 
 Бот работает только с облаком iiko и Telegram, поэтому сервер может быть где угодно. От root:
 
-```
+```bash
 curl -fsSL https://raw.githubusercontent.com/Mahovplus/control_stock/main/deploy/ustanovka.sh | bash
 nano /opt/control_stock/.env        # вписать ключи
 systemctl restart ostatki-bot
